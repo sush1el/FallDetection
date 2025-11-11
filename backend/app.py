@@ -1,6 +1,6 @@
 """
-Flask Backend for CAIretaker - Real-time Fall Detection
-Integrates YOLOv8 pose detection with webcam streaming
+Flask Backend for CAIretaker - Real-time Fall Detection with Multi-Person Tracking
+Integrates YOLOv8 pose detection with bounding boxes and tracking IDs
 """
 
 from flask import Flask, Response, jsonify
@@ -11,16 +11,14 @@ import torch
 import torch.nn as nn
 from ultralytics import YOLO
 import time
-from collections import deque
-import threading
+from collections import deque, defaultdict
 import warnings
 import os
-import sys
 
 warnings.filterwarnings('ignore')
 
 app = Flask(__name__)
-CORS(app)  # Enable CORS for React frontend
+CORS(app)
 
 # Configuration
 class Config:
@@ -37,6 +35,12 @@ class Config:
     }
     NUM_KEYPOINTS = 17
     NUM_COORDS = 3
+    # Minimum confidence for keypoints to be considered valid
+    KEYPOINT_MIN_CONFIDENCE = 0.3
+    # Minimum number of keypoints required for classification
+    MIN_KEYPOINTS_REQUIRED = 10
+    # Critical keypoints that should be visible (hips, shoulders, knees)
+    CRITICAL_KEYPOINTS = [5, 6, 11, 12, 13, 14]  # shoulders, hips, knees
 
 
 # 1D-CNN Model Architecture
@@ -90,8 +94,8 @@ class FallDetector:
         self.device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
         print(f"Using device: {self.device}")
         
-        # Load YOLO pose model
-        print("Loading YOLO pose model...")
+        # Load YOLO pose model with tracking enabled
+        print("Loading YOLO pose model with tracking...")
         self.pose_model = YOLO(Config.YOLO_MODEL)
         print("✓ YOLO model loaded")
         
@@ -116,99 +120,185 @@ class FallDetector:
         else:
             raise FileNotFoundError(f"Model file not found: {Config.CNN_MODEL_PATH}")
         
-        # Prediction smoothing
-        self.prediction_buffer = deque(maxlen=Config.SMOOTHING_WINDOW)
+        # Prediction smoothing per track ID
+        self.prediction_buffers = defaultdict(lambda: deque(maxlen=Config.SMOOTHING_WINDOW))
         
+    def check_keypoints_validity(self, keypoints):
+        """Check if keypoints are sufficient for classification"""
+        if len(keypoints) == 0:
+            return False, "No keypoints detected"
+        
+        # Count valid keypoints
+        valid_keypoints = np.sum(keypoints[:, 2] > Config.KEYPOINT_MIN_CONFIDENCE)
+        if valid_keypoints < Config.MIN_KEYPOINTS_REQUIRED:
+            return False, f"Insufficient keypoints ({valid_keypoints}/{Config.MIN_KEYPOINTS_REQUIRED})"
+        
+        # Check critical keypoints for sitting detection
+        # For sitting: we especially need hips (11,12) and knees (13,14) visible
+        critical_valid = sum(1 for idx in Config.CRITICAL_KEYPOINTS 
+                           if idx < len(keypoints) and keypoints[idx, 2] > Config.KEYPOINT_MIN_CONFIDENCE)
+        if critical_valid < len(Config.CRITICAL_KEYPOINTS) * 0.5:  # Reduced to 50% threshold
+            return False, f"Critical keypoints missing ({critical_valid}/{len(Config.CRITICAL_KEYPOINTS)})"
+        
+        return True, "Valid"
+    
+    def get_pose_features(self, keypoints):
+        """Extract pose features for debugging and analysis"""
+        features = {}
+        
+        # Hip positions (11=left hip, 12=right hip)
+        if keypoints[11, 2] > 0.3 and keypoints[12, 2] > 0.3:
+            hip_y = (keypoints[11, 1] + keypoints[12, 1]) / 2
+            features['hip_y'] = hip_y
+        
+        # Knee positions (13=left knee, 14=right knee)
+        if keypoints[13, 2] > 0.3 and keypoints[14, 2] > 0.3:
+            knee_y = (keypoints[13, 1] + keypoints[14, 1]) / 2
+            features['knee_y'] = knee_y
+        
+        # Shoulder positions (5=left shoulder, 6=right shoulder)
+        if keypoints[5, 2] > 0.3 and keypoints[6, 2] > 0.3:
+            shoulder_y = (keypoints[5, 1] + keypoints[6, 1]) / 2
+            features['shoulder_y'] = shoulder_y
+        
+        # Calculate torso angle (indicator of sitting vs standing)
+        if 'shoulder_y' in features and 'hip_y' in features:
+            features['torso_height'] = abs(features['hip_y'] - features['shoulder_y'])
+        
+        # Calculate knee bend (sitting typically has bent knees)
+        if 'hip_y' in features and 'knee_y' in features:
+            features['hip_knee_distance'] = abs(features['knee_y'] - features['hip_y'])
+        
+        return features
+    
     def detect(self, frame):
-        """Detect pose and classify activity"""
-        # Run YOLO pose detection
-        results = self.pose_model(frame, verbose=False)
+        """Detect pose and classify activity with tracking"""
+        # Run YOLO pose detection with tracking
+        results = self.pose_model.track(frame, persist=True, verbose=False, conf=0.5)
         
-        keypoints_list = []
-        prediction = 0
-        confidence = 0.0
+        detections = []
         
         if results and len(results) > 0:
             result = results[0]
             
             if hasattr(result, 'keypoints') and result.keypoints is not None:
-                if len(result.keypoints.data) > 0:
-                    # Get keypoints for first person
-                    keypoints = result.keypoints.data[0].cpu().numpy()
-                    keypoints_list = keypoints
+                keypoints_data = result.keypoints.data.cpu().numpy()
+                boxes = result.boxes
+                
+                # Get tracking IDs if available
+                track_ids = boxes.id.cpu().numpy().astype(int) if boxes.id is not None else None
+                
+                for idx, keypoints in enumerate(keypoints_data):
+                    # Get bounding box
+                    box = boxes.xyxy[idx].cpu().numpy()
+                    box_conf = boxes.conf[idx].cpu().numpy()
                     
-                    # Prepare input for CNN
-                    keypoints_tensor = torch.FloatTensor(keypoints).unsqueeze(0).to(self.device)
+                    # Get track ID or use index
+                    track_id = int(track_ids[idx]) if track_ids is not None else idx
                     
-                    # Classify pose
-                    with torch.no_grad():
-                        outputs = self.cnn_model(keypoints_tensor)
-                        probabilities = torch.softmax(outputs, dim=1)
-                        confidence_val, predicted = torch.max(probabilities, 1)
+                    # Check if keypoints are valid for classification
+                    is_valid, validity_reason = self.check_keypoints_validity(keypoints)
+                    
+                    if is_valid and box_conf > 0.4:
+                        # Prepare input for CNN
+                        keypoints_tensor = torch.FloatTensor(keypoints).unsqueeze(0).to(self.device)
                         
-                        prediction = predicted.item()
-                        confidence = confidence_val.item()
+                        # Classify pose
+                        with torch.no_grad():
+                            outputs = self.cnn_model(keypoints_tensor)
+                            probabilities = torch.softmax(outputs, dim=1)
+                            confidence_val, predicted = torch.max(probabilities, 1)
+                            
+                            prediction = predicted.item()
+                            confidence = confidence_val.item()
+                        
+                        # Smooth predictions per track ID
+                        self.prediction_buffers[track_id].append(prediction)
+                        if len(self.prediction_buffers[track_id]) >= Config.SMOOTHING_WINDOW // 2:
+                            prediction = max(set(self.prediction_buffers[track_id]), 
+                                           key=self.prediction_buffers[track_id].count)
+                        
+                        status = "classified"
+                    else:
+                        # Don't classify, just show tracking
+                        prediction = None
+                        confidence = 0.0
+                        status = "tracking_only"
+                        validity_reason = validity_reason if not is_valid else "Low box confidence"
                     
-                    # Smooth predictions
-                    self.prediction_buffer.append(prediction)
-                    if len(self.prediction_buffer) >= Config.SMOOTHING_WINDOW // 2:
-                        prediction = max(set(self.prediction_buffer), 
-                                       key=self.prediction_buffer.count)
+                    detections.append({
+                        'track_id': track_id,
+                        'box': box,
+                        'box_conf': float(box_conf),
+                        'keypoints': keypoints,
+                        'prediction': prediction,
+                        'confidence': float(confidence),
+                        'status': status,
+                        'reason': validity_reason if status == "tracking_only" else None
+                    })
         
-        return results, prediction, confidence, keypoints_list
+        return detections
     
-    def draw_results(self, frame, prediction, confidence, keypoints):
-        """Draw skeleton and prediction on frame"""
-        if len(keypoints) > 0:
-            color = Config.CLASS_COLORS.get(prediction, (255, 255, 255))
-            class_name = Config.CLASS_NAMES.get(prediction, "Unknown")
+    def draw_results(self, frame, detections):
+        """Draw bounding boxes, IDs, and classifications on frame"""
+        for detection in detections:
+            track_id = detection['track_id']
+            box = detection['box']
+            keypoints = detection['keypoints']
+            prediction = detection['prediction']
+            confidence = detection['confidence']
+            status = detection['status']
             
-            # Draw keypoints
-            for i, kp in enumerate(keypoints):
-                x, y, conf = kp
-                if conf > 0.3:
-                    cv2.circle(frame, (int(x), int(y)), 8, color, -1)
+            # Determine color based on prediction or default for tracking only
+            if status == "classified" and prediction is not None:
+                color = Config.CLASS_COLORS.get(prediction, (255, 255, 255))
+                class_name = Config.CLASS_NAMES.get(prediction, "Unknown")
+            else:
+                color = (128, 128, 128)  # Gray for tracking only
+                class_name = "Tracking"
             
-            # Draw skeleton connections
-            connections = [
-                (5, 6), (5, 7), (7, 9), (6, 8), (8, 10),
-                (5, 11), (6, 12), (11, 12),
-                (11, 13), (13, 15), (12, 14), (14, 16)
-            ]
+            # Draw bounding box
+            x1, y1, x2, y2 = map(int, box)
+            cv2.rectangle(frame, (x1, y1), (x2, y2), color, 3)
             
-            for start, end in connections:
-                if keypoints[start, 2] > 0.3 and keypoints[end, 2] > 0.3:
-                    pt1 = (int(keypoints[start, 0]), int(keypoints[start, 1]))
-                    pt2 = (int(keypoints[end, 0]), int(keypoints[end, 1]))
-                    cv2.line(frame, pt1, pt2, color, 3)
+            # Draw keypoints (if valid)
+            if status == "classified":
+                for i, kp in enumerate(keypoints):
+                    x, y, conf = kp
+                    if conf > Config.KEYPOINT_MIN_CONFIDENCE:
+                        cv2.circle(frame, (int(x), int(y)), 4, color, -1)
+                
+                # Draw skeleton connections
+                connections = [
+                    (5, 6), (5, 7), (7, 9), (6, 8), (8, 10),
+                    (5, 11), (6, 12), (11, 12),
+                    (11, 13), (13, 15), (12, 14), (14, 16)
+                ]
+                
+                for start, end in connections:
+                    if (keypoints[start, 2] > Config.KEYPOINT_MIN_CONFIDENCE and 
+                        keypoints[end, 2] > Config.KEYPOINT_MIN_CONFIDENCE):
+                        pt1 = (int(keypoints[start, 0]), int(keypoints[start, 1]))
+                        pt2 = (int(keypoints[end, 0]), int(keypoints[end, 1]))
+                        cv2.line(frame, pt1, pt2, color, 2)
             
-            # Draw prediction info box
-            box_x, box_y = 20, 20
-            box_width, box_height = 450, 140
+            # Draw ID and status label above box
+            label_y = max(y1 - 10, 20)
             
-            cv2.rectangle(frame, (box_x, box_y), 
-                         (box_x + box_width, box_y + box_height), 
-                         (0, 0, 0), -1)
-            cv2.rectangle(frame, (box_x, box_y), 
-                         (box_x + box_width, box_y + box_height), 
-                         color, 4)
+            if status == "classified":
+                label = f"ID:{track_id} | {class_name} ({confidence*100:.0f}%)"
+            else:
+                label = f"ID:{track_id} | {class_name}"
             
-            # Status text
-            cv2.putText(frame, f"Status: {class_name}", 
-                       (box_x + 15, box_y + 50),
-                       cv2.FONT_HERSHEY_SIMPLEX, 1.4, color, 3)
-            cv2.putText(frame, f"Confidence: {confidence*100:.1f}%", 
-                       (box_x + 15, box_y + 100),
-                       cv2.FONT_HERSHEY_SIMPLEX, 1.0, (255, 255, 255), 2)
+            # Get label size for background
+            (label_w, label_h), _ = cv2.getTextSize(label, cv2.FONT_HERSHEY_SIMPLEX, 0.6, 2)
             
-            # Fall alert
-            if prediction == 2 and confidence > Config.CONFIDENCE_THRESHOLD:
-                h, w = frame.shape[:2]
-                alert_text = "FALL DETECTED!"
-                text_size = cv2.getTextSize(alert_text, cv2.FONT_HERSHEY_SIMPLEX, 2.0, 5)[0]
-                text_x = (w - text_size[0]) // 2
-                cv2.putText(frame, alert_text, (text_x, 80),
-                           cv2.FONT_HERSHEY_SIMPLEX, 2.0, (0, 0, 255), 5)
+            # Draw background rectangle for label
+            cv2.rectangle(frame, (x1, label_y - label_h - 8), (x1 + label_w + 10, label_y + 2), color, -1)
+            
+            # Draw label text
+            cv2.putText(frame, label, (x1 + 5, label_y - 5),
+                       cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 2)
         
         return frame
 
@@ -216,16 +306,14 @@ class FallDetector:
 # Global variables
 detector = None
 camera = None
-camera_lock = threading.Lock()
+camera_lock = __import__('threading').Lock()
 camera_initialized = False
 current_status = {
-    'status': 'Initializing',
-    'confidence': 0.0,
     'people_detected': 0,
-    'is_fall': False,
+    'detections': [],
     'fps': 0
 }
-status_lock = threading.Lock()
+status_lock = __import__('threading').Lock()
 
 
 def initialize_detector():
@@ -254,7 +342,6 @@ def initialize_camera():
         print("Initializing Camera...")
         print("="*60)
         
-        # Release any existing camera
         if camera is not None:
             try:
                 camera.release()
@@ -262,23 +349,20 @@ def initialize_camera():
                 pass
             camera = None
         
-        # Try different camera indices
         for cam_index in [0, 1, 2]:
             print(f"Trying camera index {cam_index}...")
             try:
-                cap = cv2.VideoCapture(cam_index, cv2.CAP_DSHOW)  # Try DirectShow on Windows
+                cap = cv2.VideoCapture(cam_index, cv2.CAP_DSHOW)
                 
                 if not cap.isOpened():
-                    cap = cv2.VideoCapture(cam_index)  # Fallback to default
+                    cap = cv2.VideoCapture(cam_index)
                 
                 if cap.isOpened():
-                    # Test read
                     ret, frame = cap.read()
                     if ret and frame is not None:
                         print(f"✓ Camera {cam_index} opened successfully!")
                         print(f"  Resolution: {frame.shape[1]}x{frame.shape[0]}")
                         
-                        # Configure camera
                         cap.set(cv2.CAP_PROP_FRAME_WIDTH, 1280)
                         cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 720)
                         cap.set(cv2.CAP_PROP_FPS, 30)
@@ -303,10 +387,9 @@ def initialize_camera():
 
 
 def generate_frames():
-    """Generate frames with pose detection"""
+    """Generate frames with pose detection and tracking"""
     global current_status, camera
     
-    # Initialize camera if needed
     if not initialize_camera():
         print("✗ Camera initialization failed, sending error frame")
         error_frame = np.zeros((480, 640, 3), dtype=np.uint8)
@@ -323,7 +406,7 @@ def generate_frames():
                    b'Content-Type: image/jpeg\r\n\r\n' + frame_bytes + b'\r\n')
             time.sleep(1)
     
-    print("✓ Starting frame generation...")
+    print("✓ Starting frame generation with multi-person tracking...")
     frame_count = 0
     fps_time = time.time()
     fps_value = 0
@@ -354,22 +437,27 @@ def generate_frames():
                 time.sleep(0.1)
                 continue
             
-            # Reset failure counter on success
             consecutive_failures = 0
             
-            # Detect and classify
+            # Detect and classify with tracking
             if detector is not None:
-                _, prediction, confidence, keypoints = detector.detect(frame)
+                detections = detector.detect(frame)
                 
                 # Draw results
-                frame = detector.draw_results(frame, prediction, confidence, keypoints)
+                frame = detector.draw_results(frame, detections)
                 
                 # Update status
                 with status_lock:
-                    current_status['status'] = Config.CLASS_NAMES.get(prediction, "Unknown")
-                    current_status['confidence'] = float(confidence)
-                    current_status['people_detected'] = 1 if len(keypoints) > 0 else 0
-                    current_status['is_fall'] = prediction == 2 and confidence > Config.CONFIDENCE_THRESHOLD
+                    current_status['people_detected'] = len(detections)
+                    current_status['detections'] = [
+                        {
+                            'id': d['track_id'],
+                            'status': Config.CLASS_NAMES.get(d['prediction'], 'Tracking') if d['status'] == 'classified' else 'Tracking',
+                            'confidence': d['confidence'],
+                            'is_fall': d['prediction'] == 2 and d['confidence'] > Config.CONFIDENCE_THRESHOLD if d['status'] == 'classified' else False
+                        }
+                        for d in detections
+                    ]
                     
                 # Calculate FPS
                 frame_count += 1
@@ -382,6 +470,11 @@ def generate_frames():
                 # Draw FPS
                 cv2.putText(frame, f"FPS: {fps_value:.1f}", 
                            (frame.shape[1] - 200, 40),
+                           cv2.FONT_HERSHEY_SIMPLEX, 1.0, (255, 255, 255), 2)
+                
+                # Draw people count
+                cv2.putText(frame, f"People: {len(detections)}", 
+                           (20, 40),
                            cv2.FONT_HERSHEY_SIMPLEX, 1.0, (255, 255, 255), 2)
             
             # Encode frame
@@ -432,10 +525,9 @@ def health():
 
 if __name__ == '__main__':
     print("\n" + "="*60)
-    print("CAIretaker Backend - Fall Detection System")
+    print("CAIretaker Backend - Multi-Person Fall Detection with Tracking")
     print("="*60)
     
-    # Initialize detector
     if initialize_detector():
         print("\nStarting Flask server...")
         print("Backend will be available at: http://localhost:5000")
