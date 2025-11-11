@@ -1,0 +1,82 @@
+.logs-container {
+  width: 100%;
+}
+
+.logs-card {
+  border-radius: 8px;
+}
+
+.logs-card .ant-card-head {
+  background: #fafafa;
+  border-bottom: 2px solid #f0f0f0;
+}
+
+.logs-header {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 16px;
+  margin-bottom: 16px;
+}
+
+.status-fall {
+  color: #ff4d4f;
+  font-weight: 600;
+  background: #fff1f0;
+  padding: 4px 8px;
+  border-radius: 4px;
+}
+
+.status-normal {
+  color: #52c41a;
+  font-weight: 600;
+  background: #f6ffed;
+  padding: 4px 8px;
+  border-radius: 4px;
+}
+
+.severity-critical {
+  color: #ff4d4f;
+  font-weight: 600;
+  background: #fff1f0;
+  padding: 4px 8px;
+  border-radius: 4px;
+}
+
+.severity-medium {
+  color: #fa8c16;
+  font-weight: 600;
+  background: #fff7e6;
+  padding: 4px 8px;
+  border-radius: 4px;
+}
+
+.severity-low {
+  color: #52c41a;
+  font-weight: 600;
+  background: #f6ffed;
+  padding: 4px 8px;
+  border-radius: 4px;
+}
+
+/* Table customization */
+.ant-table-thead > tr > th {
+  background: #fafafa;
+  font-weight: 600;
+}
+
+.ant-table-tbody > tr:hover > td {
+  background: #f0f2f5;
+}
+
+@media (max-width: 768px) {
+  .logs-header {
+    flex-direction: column;
+    align-items: stretch;
+  }
+
+  .logs-header > * {
+    width: 100%;
+  }
+}

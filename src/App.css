@@ -1,0 +1,122 @@
+/* Reset and base styles */
+* {
+  box-sizing: border-box;
+}
+
+html, body {
+  margin: 0;
+  padding: 0;
+  width: 100%;
+  min-height: 100vh;
+}
+
+#root {
+  width: 100%;
+  min-height: 100vh;
+  display: block;
+}
+
+/* Header Styles */
+.header-container {
+  background: white !important;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  padding: 16px 32px !important;
+  height: auto;
+  min-height: 80px;
+  box-shadow: 0 2px 8px rgba(0, 0, 0, 0.1);
+}
+
+.logo-full-width {
+  width: 100%;
+  max-width: 1200px;
+  display: flex;
+  justify-content: center;
+  align-items: center;
+}
+
+.logo-full {
+  height: 60px;
+  width: auto;
+  max-width: 100%;
+  display: block;
+}
+
+/* Menu Styles */
+.main-menu {
+  border-bottom: 2px solid #1a252f;
+  background: #2c3e50 !important;
+}
+
+.main-menu .ant-menu-item {
+  color: rgba(255, 255, 255, 0.7) !important;
+  border-bottom: 3px solid transparent !important;
+  margin: 0 4px;
+  padding: 0 20px;
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+
+.main-menu .ant-menu-item:hover {
+  color: white !important;
+  background: rgba(255, 255, 255, 0.1) !important;
+}
+
+.main-menu .ant-menu-item-selected {
+  color: white !important;
+  background: rgba(64, 169, 255, 0.2) !important;
+  border-bottom: 3px solid #40a9ff !important;
+}
+
+.main-menu .ant-menu-item-icon {
+  font-size: 16px;
+}
+
+/* Layout adjustments */
+.ant-layout {
+  min-height: 100vh;
+}
+
+.ant-layout-content {
+  overflow: visible;
+}
+
+/* Card styles */
+.ant-card {
+  border-radius: 8px;
+  box-shadow: 0 2px 8px rgba(0, 0, 0, 0.1);
+}
+
+.ant-card-head {
+  background: #fafafa;
+  border-bottom: 2px solid #f0f0f0;
+}
+
+/* Responsive adjustments */
+@media (max-width: 768px) {
+  .logo-full {
+    height: 50px;
+  }
+
+  .main-menu .ant-menu-item {
+    padding: 0 12px;
+    font-size: 12px;
+  }
+
+  .main-menu .ant-menu-item-icon {
+    font-size: 14px;
+  }
+}
+
+@media (max-width: 576px) {
+  .header-container {
+    padding: 12px 16px !important;
+    min-height: 60px;
+  }
+
+  .logo-full {
+    height: 40px;
+  }
+}

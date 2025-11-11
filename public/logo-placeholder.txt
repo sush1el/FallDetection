@@ -1,0 +1,10 @@
+Place your logo file here as "logo.png"
+
+Recommended specifications:
+- Format: PNG (with transparency) or SVG
+- Size: 48x48 pixels or larger
+- Aspect ratio: Square or horizontal
+- Background: Transparent
+
+The logo will appear in the top-left corner of the header.
+If no logo is found, a "CAIretaker" text placeholder will be shown instead.
