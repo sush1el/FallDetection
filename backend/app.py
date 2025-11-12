@@ -1,6 +1,17 @@
 """
 Flask Backend for CAIretaker - Enhanced Fall Detection with Multi-Person Tracking
 Exact same detection logic as inference code + person tracking with IDs and database logging
+
+SOLUTION 2 INTEGRATED: Bending Detection
+- Adds leg angle analysis to distinguish bending from falling
+- Prevents false positives when bending down to pick up objects
+- Uses torso-leg angle difference, hip elevation, and feet position
+- Overrides model prediction if bending is detected with >60% confidence
+
+FIX: Temporal Activation Consistency Issue
+- Problem: Smoothing buffer can change "fallen" prediction to "standing" before temporal tracking activates
+- Solution: Check raw model prediction (before smoothing) for temporal activation
+- This ensures monitoring phase triggers consistently for any fallen pose
 """
 
 from flask import Flask, Response, jsonify, request
@@ -28,6 +39,11 @@ class Config:
     YOLO_MODEL = "yolo11m-pose.pt"
     CONFIDENCE_THRESHOLD = 0.65
     SMOOTHING_WINDOW = 7
+    
+    # TEMPORAL FALL DETECTION SETTINGS
+    FALL_CONFIRMATION_TIME = 1  # Seconds person must stay fallen before alert
+    FALL_CONFIRMATION_FRAMES = 3  # Minimum consecutive frames in fallen state
+    
     CLASS_NAMES = {0: "Standing", 1: "Sitting", 2: "Fallen"}
     CLASS_COLORS = {
         0: (0, 255, 0),    # Standing - Green
@@ -280,6 +296,203 @@ def extract_spatial_features(keypoints, image_shape):
 
 
 # ============================================================================
+# SOLUTION 2: BENDING DETECTION FUNCTIONS
+# ============================================================================
+
+def calculate_leg_angles(keypoints):
+    """
+    Calculate average angle of legs from vertical
+    
+    Returns:
+        float: Average leg angle in degrees (0° = vertical, 90° = horizontal)
+        None if legs not visible
+    
+    Usage:
+        - Bending: legs vertical (< 30°)
+        - Fallen: legs horizontal (> 60°)
+    """
+    left_hip = keypoints[11]
+    right_hip = keypoints[12]
+    left_ankle = keypoints[15]
+    right_ankle = keypoints[16]
+    
+    leg_angles = []
+    
+    # Calculate left leg angle
+    if (left_hip[2] > 0.3 and left_ankle[2] > 0.3):
+        # Vector from hip to ankle (full leg)
+        leg_vec = np.array([
+            left_ankle[0] - left_hip[0],
+            left_ankle[1] - left_hip[1]
+        ])
+        
+        # Vertical vector (pointing down)
+        vertical = np.array([0, 1])
+        
+        # Calculate angle from vertical
+        if np.linalg.norm(leg_vec) > 1e-6:
+            cos_angle = np.dot(leg_vec, vertical) / (
+                np.linalg.norm(leg_vec) * np.linalg.norm(vertical)
+            )
+            cos_angle = np.clip(cos_angle, -1.0, 1.0)
+            angle = np.degrees(np.arccos(cos_angle))
+            leg_angles.append(angle)
+    
+    # Calculate right leg angle
+    if (right_hip[2] > 0.3 and right_ankle[2] > 0.3):
+        leg_vec = np.array([
+            right_ankle[0] - right_hip[0],
+            right_ankle[1] - right_hip[1]
+        ])
+        
+        vertical = np.array([0, 1])
+        
+        if np.linalg.norm(leg_vec) > 1e-6:
+            cos_angle = np.dot(leg_vec, vertical) / (
+                np.linalg.norm(leg_vec) * np.linalg.norm(vertical)
+            )
+            cos_angle = np.clip(cos_angle, -1.0, 1.0)
+            angle = np.degrees(np.arccos(cos_angle))
+            leg_angles.append(angle)
+    
+    # Return average if at least one leg visible
+    if len(leg_angles) > 0:
+        return np.mean(leg_angles)
+    return None
+
+
+def calculate_torso_leg_difference(keypoints):
+    """
+    Calculate difference between torso angle and leg angle
+    
+    Returns:
+        float: Angle difference in degrees
+        None if cannot calculate
+    
+    Usage:
+        - Bending: Large difference (> 40°) - torso bent, legs straight
+        - Fallen: Small difference (< 20°) - both horizontal
+    """
+    torso_angle = calculate_body_angle(keypoints)
+    leg_angle = calculate_leg_angles(keypoints)
+    
+    if torso_angle is not None and leg_angle is not None:
+        angle_diff = abs(torso_angle - leg_angle)
+        return angle_diff
+    
+    return None
+
+
+def is_bending_posture(keypoints, image_shape):
+    """
+    Comprehensive check to determine if person is bending vs fallen
+    
+    Args:
+        keypoints: (17, 3) array of keypoints
+        image_shape: tuple (height, width) or (height, width, channels)
+    
+    Returns:
+        tuple: (is_bending, confidence, reasons)
+            - is_bending: True if detected as bending
+            - confidence: float 0-1, confidence in the assessment
+            - reasons: list of strings explaining the decision
+    
+    Scoring System:
+        +4 points: Very strong indicator of bending
+        +3 points: Strong indicator of bending
+        +2 points: Moderate indicator of bending
+        +1 point: Weak indicator of bending
+        -2 points: Indicator of falling
+        -3 points: Strong indicator of falling
+        
+        Total >= 4: Classified as bending
+    """
+    reasons = []
+    bending_score = 0
+    
+    # Get image dimensions
+    h, w = image_shape[:2] if len(image_shape) >= 2 else (1080, 1920)
+    
+    # 1. CHECK LEG ANGLES (CRITICAL FOR EXTREME BENDING)
+    leg_angle = calculate_leg_angles(keypoints)
+    if leg_angle is not None:
+        if leg_angle < 35:  # Legs are relatively vertical
+            bending_score += 4  # Most important indicator
+            reasons.append(f"Legs vertical ({leg_angle:.0f}°)")
+        elif leg_angle > 60:  # Legs are horizontal (fallen)
+            bending_score -= 3
+            reasons.append(f"Legs horizontal ({leg_angle:.0f}°)")
+        else:  # Legs at moderate angle (35-60°)
+            bending_score += 2
+            reasons.append(f"Legs moderate ({leg_angle:.0f}°)")
+    
+    # 2. CHECK TORSO-LEG ANGLE DIFFERENCE
+    angle_diff = calculate_torso_leg_difference(keypoints)
+    if angle_diff is not None:
+        if angle_diff > 35:  # Large difference = torso bent, legs straight
+            bending_score += 3
+            reasons.append(f"Torso bent, legs straight (Δ{angle_diff:.0f}°)")
+        elif angle_diff < 20:  # Small difference = both horizontal
+            bending_score -= 2
+            reasons.append(f"Fully horizontal (Δ{angle_diff:.0f}°)")
+        else:
+            bending_score += 1
+            reasons.append(f"Moderate bend (Δ{angle_diff:.0f}°)")
+    
+    # 3. CHECK ANKLE POSITIONS (CRITICAL - FEET ON GROUND = BENDING)
+    left_ankle = keypoints[15]
+    right_ankle = keypoints[16]
+    
+    ankle_y_positions = []
+    if left_ankle[2] > 0.3:
+        ankle_y_positions.append(left_ankle[1] / h)
+    if right_ankle[2] > 0.3:
+        ankle_y_positions.append(right_ankle[1] / h)
+    
+    if len(ankle_y_positions) > 0:
+        avg_ankle_y = np.mean(ankle_y_positions)
+        if avg_ankle_y > 0.80:  # Ankles near bottom (standing/bending)
+            bending_score += 3  # Feet on ground is very strong indicator
+            reasons.append(f"Feet on ground ({avg_ankle_y:.2f})")
+    
+    # 4. CHECK HIP ELEVATION (More lenient for deep bending)
+    hip_height = check_hip_position(keypoints, image_shape)
+    if hip_height is not None:
+        if hip_height < 0.5:  # Hips elevated
+            bending_score += 2
+            reasons.append(f"Hips elevated ({hip_height:.2f})")
+        elif hip_height > 0.75:  # Hips very low
+            bending_score -= 3
+            reasons.append(f"Hips on ground ({hip_height:.2f})")
+        else:  # Hips at moderate height (0.5-0.75)
+            bending_score += 1
+            reasons.append(f"Hips moderate ({hip_height:.2f})")
+    
+    # 5. CHECK KNEE POSITIONS
+    knee_hip_dist, knee_height = check_knee_position(keypoints, image_shape)
+    if knee_hip_dist is not None:
+        if knee_hip_dist > 0.15:  # Knees bent
+            bending_score += 1
+            reasons.append("Knees bent")
+    
+    # 6. ADDITIONAL CHECK: If legs vertical AND feet on ground, DEFINITELY bending
+    if leg_angle is not None and len(ankle_y_positions) > 0:
+        avg_ankle_y = np.mean(ankle_y_positions)
+        if leg_angle < 40 and avg_ankle_y > 0.80:
+            # This combination is definitive proof of bending, not falling
+            bending_score += 2  # Bonus points for this strong combination
+            reasons.append("STRONG: Vertical legs + grounded feet")
+    
+    # CALCULATE FINAL DECISION
+    is_bending = bending_score >= 4
+    
+    # Calculate confidence (0-1 scale)
+    confidence = min(abs(bending_score) / 14.0, 1.0)
+    
+    return is_bending, confidence, reasons
+
+
+# ============================================================================
 # FALL DETECTOR CLASS
 # ============================================================================
 
@@ -310,6 +523,13 @@ class FallDetector:
         
         # Track fall states per person
         self.fall_states = {}
+        
+        # Temporal fall tracking
+        self.fall_candidates = defaultdict(lambda: {
+            'start_time': None,
+            'frame_count': 0,
+            'consecutive_fallen_frames': 0
+        })
         
         # Database instance
         self.db = get_database()
@@ -380,43 +600,162 @@ class FallDetector:
                             probabilities = torch.softmax(outputs, dim=1)
                             confidence_val, predicted = torch.max(probabilities, 1)
                             
-                            prediction = predicted.item()
-                            confidence = confidence_val.item()
+                            # ========================================
+                            # FIX: Store RAW prediction BEFORE smoothing
+                            # ========================================
+                            raw_prediction = predicted.item()
+                            raw_confidence = confidence_val.item()
                         
-                        # Smooth predictions per track ID
-                        self.prediction_buffers[track_id].append(prediction)
+                        # Smooth predictions per track ID (for display purposes)
+                        self.prediction_buffers[track_id].append(raw_prediction)
                         if len(self.prediction_buffers[track_id]) >= Config.SMOOTHING_WINDOW // 2:
-                            prediction = max(set(self.prediction_buffers[track_id]), 
+                            smoothed_prediction = max(set(self.prediction_buffers[track_id]), 
                                            key=self.prediction_buffers[track_id].count)
+                        else:
+                            smoothed_prediction = raw_prediction
+                        
+                        # Use smoothed for display
+                        prediction = smoothed_prediction
+                        confidence = raw_confidence
+                        
+                        # ========================================
+                        # FIX: Use RAW prediction for temporal activation
+                        # This ensures monitoring phase triggers consistently
+                        # ========================================
+                        is_raw_fallen = (raw_prediction == 2 and raw_confidence > Config.CONFIDENCE_THRESHOLD)
                         
                         # Check for fall state changes
-                        is_currently_fallen = (prediction == 2 and confidence > Config.CONFIDENCE_THRESHOLD)
                         was_fallen = self.fall_states[track_id]['is_fallen']
                         
-                        # NEW FALL DETECTED
-                        if is_currently_fallen and not was_fallen:
-                            print(f"\n🚨 NEW FALL DETECTED: Person ID {track_id}")
-                            incident_id = self.db.log_fall_incident(
-                                person_id=track_id,
-                                confidence=confidence,
-                                location=Config.LOCATION_NAME
-                            )
-                            self.fall_states[track_id]['is_fallen'] = True
-                            self.fall_states[track_id]['incident_id'] = incident_id
+                        # ========================================
+                        # SOLUTION 2: BENDING CHECK (on raw prediction)
+                        # ========================================
+                        if is_raw_fallen:
+                            # Model says fallen, but check if it's actually bending
+                            is_bending, bend_conf, reasons = is_bending_posture(keypoints, frame.shape)
+                            
+                            if is_bending and bend_conf > 0.5:
+                                # Override prediction - it's bending, not fallen
+                                print(f"✓ Person ID {track_id}: Detected BENDING (not fallen)")
+                                print(f"  Confidence: {bend_conf:.2f}")
+                                print(f"  Reasons: {', '.join(reasons)}")
+                                
+                                # Change prediction to standing
+                                prediction = 0
+                                confidence = bend_conf
+                                is_raw_fallen = False  # Also update raw fallen status
+                        # ========================================
                         
-                        # RECOVERY DETECTED
-                        elif not is_currently_fallen and was_fallen:
-                            print(f"\n✅ RECOVERY: Person ID {track_id} stood up")
-                            self.db.resolve_fall_for_person(track_id)
-                            self.fall_states[track_id]['is_fallen'] = False
-                            self.fall_states[track_id]['incident_id'] = None
+                        # ========================================
+                        # TEMPORAL FALL CONFIRMATION WITH MANDATORY MONITORING
+                        # Now uses is_raw_fallen instead of checking smoothed prediction
+                        # ========================================
+                        current_time = time.time()
+                        candidate = self.fall_candidates[track_id]
+                        
+                        if is_raw_fallen:
+                            # Person detected in fallen position (RAW prediction)
+                            
+                            # CRITICAL FIX: If person is already marked as fallen, keep them fallen
+                            # but don't start new monitoring
+                            if was_fallen:
+                                # Already confirmed fallen, keep tracking
+                                print(f"🔴 Person ID {track_id}: Maintaining FALLEN state (already confirmed)")
+                            elif candidate['start_time'] is None:
+                                # FIRST detection of fallen position - START MONITORING
+                                candidate['start_time'] = current_time
+                                candidate['frame_count'] = 1
+                                candidate['consecutive_fallen_frames'] = 1
+                                
+                                # CRITICAL: Ensure is_fallen stays False during monitoring
+                                if self.fall_states[track_id]['is_fallen']:
+                                    print(f"⚠️ WARNING: Person ID {track_id} had is_fallen=True, forcing False for monitoring")
+                                    self.fall_states[track_id]['is_fallen'] = False
+                                
+                                print(f"⏱️ Person ID {track_id}: Fallen position detected, STARTING MONITORING...")
+                                print(f"   Raw prediction: {raw_prediction}, Confidence: {raw_confidence:.2%}")
+                                print(f"   Smoothed prediction: {smoothed_prediction}")
+                            else:
+                                # Continuing in fallen position - STILL MONITORING
+                                candidate['frame_count'] += 1
+                                candidate['consecutive_fallen_frames'] += 1
+                                elapsed_time = current_time - candidate['start_time']
+                                
+                                # Check if fall is confirmed (time AND frames threshold met)
+                                time_threshold_met = elapsed_time >= Config.FALL_CONFIRMATION_TIME
+                                frames_threshold_met = candidate['consecutive_fallen_frames'] >= Config.FALL_CONFIRMATION_FRAMES
+                                
+                                if time_threshold_met and frames_threshold_met and not was_fallen:
+                                    # CONFIRMED FALL - NOW trigger alert
+                                    print(f"\n🚨 CONFIRMED FALL: Person ID {track_id}")
+                                    print(f"   Duration: {elapsed_time:.1f}s")
+                                    print(f"   Frames: {candidate['consecutive_fallen_frames']}")
+                                    print(f"   Time threshold met: {time_threshold_met}")
+                                    print(f"   Frames threshold met: {frames_threshold_met}")
+                                    
+                                    incident_id = self.db.log_fall_incident(
+                                        person_id=track_id,
+                                        confidence=confidence,
+                                        location=Config.LOCATION_NAME
+                                    )
+                                    self.fall_states[track_id]['is_fallen'] = True
+                                    self.fall_states[track_id]['incident_id'] = incident_id
+                                    
+                                    print(f"   Incident ID: {incident_id} logged")
+                                else:
+                                    # Still monitoring, not confirmed yet
+                                    remaining_time = Config.FALL_CONFIRMATION_TIME - elapsed_time
+                                    remaining_frames = Config.FALL_CONFIRMATION_FRAMES - candidate['consecutive_fallen_frames']
+                                    
+                                    if remaining_time > 0 or remaining_frames > 0:
+                                        print(f"⏱️ Person ID {track_id}: MONITORING... {remaining_time:.1f}s, {remaining_frames} frames remaining")
+                                    
+                                    # ENSURE is_fallen stays False during monitoring
+                                    if self.fall_states[track_id]['is_fallen']:
+                                        print(f"⚠️ ERROR: is_fallen was True during monitoring! Forcing False.")
+                                        self.fall_states[track_id]['is_fallen'] = False
+                        
+                        else:
+                            # Not in fallen position (RAW prediction says not fallen)
+                            if candidate['start_time'] is not None:
+                                elapsed = current_time - candidate['start_time']
+                                
+                                # Was monitoring but person recovered before confirmation
+                                if elapsed < Config.FALL_CONFIRMATION_TIME:
+                                    print(f"✓ Person ID {track_id}: Brief fallen pose detected (transition), no alert")
+                                    print(f"  Duration: {elapsed:.2f}s (< {Config.FALL_CONFIRMATION_TIME}s threshold)")
+                                
+                                # Reset temporal tracking
+                                candidate['start_time'] = None
+                                candidate['frame_count'] = 0
+                                candidate['consecutive_fallen_frames'] = 0
+                            
+                            # Check for recovery from confirmed fall
+                            if was_fallen:
+                                print(f"\n✅ RECOVERY: Person ID {track_id} stood up")
+                                self.db.resolve_fall_for_person(track_id)
+                                self.fall_states[track_id]['is_fallen'] = False
+                                self.fall_states[track_id]['incident_id'] = None
+                        # ========================================
                         
                         status = "classified"
                     else:
-                        # Not enough keypoints - just track
+                        # ========================================
+                        # Not enough keypoints - DO NOT classify as fallen
+                        # ========================================
                         prediction = None
                         confidence = 0.0
-                        status = "tracking_only"
+                        status = "insufficient_keypoints"
+                        
+                        # Reset fall candidate if tracking was ongoing
+                        if track_id in self.fall_candidates:
+                            candidate = self.fall_candidates[track_id]
+                            if candidate['start_time'] is not None:
+                                print(f"⚠ Person ID {track_id}: Keypoints lost during monitoring, resetting")
+                                candidate['start_time'] = None
+                                candidate['frame_count'] = 0
+                                candidate['consecutive_fallen_frames'] = 0
+                        # ========================================
                     
                     detections.append({
                         'track_id': track_id,
@@ -439,11 +778,36 @@ class FallDetector:
             del self.fall_states[person_id]
             if person_id in self.prediction_buffers:
                 del self.prediction_buffers[person_id]
+            if person_id in self.fall_candidates:
+                del self.fall_candidates[person_id]
         
         return detections
     
     def draw_results(self, frame, detections):
-        """Draw bounding boxes, IDs, and classifications on frame"""
+        """Draw bounding boxes, IDs, and classifications on frame with ENHANCED keypoint visibility"""
+        current_time = time.time()
+        
+        # COCO-17 skeleton connections (body structure)
+        skeleton_connections = [
+            # Head to shoulders
+            (0, 1), (0, 2),  # Nose to eyes
+            (1, 3), (2, 4),  # Eyes to ears
+            (0, 5), (0, 6),  # Nose to shoulders
+            
+            # Torso
+            (5, 6),   # Shoulders
+            (5, 11), (6, 12),  # Shoulders to hips
+            (11, 12),  # Hips
+            
+            # Arms
+            (5, 7), (7, 9),   # Left arm
+            (6, 8), (8, 10),  # Right arm
+            
+            # Legs
+            (11, 13), (13, 15),  # Left leg
+            (12, 14), (14, 16)   # Right leg
+        ]
+        
         for detection in detections:
             track_id = detection['track_id']
             box = detection['box']
@@ -451,90 +815,114 @@ class FallDetector:
             prediction = detection['prediction']
             confidence = detection['confidence']
             status = detection['status']
-            is_fallen = detection.get('is_fallen', False)
+            is_fallen = detection['is_fallen']
+            visible_count = detection['visible_count']
             
-            # Determine color and class name
-            if is_fallen:
-                color = (0, 0, 255)  # Red for active fall
-                class_name = "FALLEN"
-            elif status == "classified" and prediction is not None:
+            x1, y1, x2, y2 = map(int, box)
+            
+            # CRITICAL FIX: Check monitoring state FIRST, before checking is_fallen
+            # This ensures MONITORING always displays during the confirmation period
+            candidate = self.fall_candidates.get(track_id)
+            is_monitoring = candidate is not None and candidate.get('start_time') is not None
+            
+            # Determine color based on fall state - MONITORING takes priority
+            if is_monitoring and not is_fallen:
+                # Currently in MONITORING phase (not yet confirmed)
+                elapsed = current_time - candidate['start_time']
+                remaining = Config.FALL_CONFIRMATION_TIME - elapsed
+                color = (0, 165, 255)  # ORANGE for monitoring
+                label = f"ID {track_id}: MONITORING ({remaining:.1f}s)"
+                box_thickness = 3
+            elif is_fallen:
+                # Confirmed fall (monitoring completed)
+                color = (0, 0, 255)  # RED for confirmed fall
+                label = f"ID {track_id}: FALLEN (ALERT)"
+                box_thickness = 4
+            elif prediction is not None:
+                # Normal classification (not fallen, not monitoring)
                 color = Config.CLASS_COLORS.get(prediction, (255, 255, 255))
                 class_name = Config.CLASS_NAMES.get(prediction, "Unknown")
+                label = f"ID {track_id}: {class_name} ({confidence:.0%})"
+                box_thickness = 2
             else:
-                color = (128, 128, 128)
-                class_name = "Tracking"
+                # Tracking only (insufficient keypoints)
+                color = (128, 128, 128)  # GRAY for tracking only
+                label = f"ID {track_id}: Tracking ({visible_count} kpts)"
+                box_thickness = 2
             
             # Draw bounding box
-            x1, y1, x2, y2 = map(int, box)
-            thickness = 5 if is_fallen else 3
-            cv2.rectangle(frame, (x1, y1), (x2, y2), color, thickness)
+            cv2.rectangle(frame, (x1, y1), (x2, y2), color, box_thickness)
             
-            # Draw keypoints
-            if status == "classified":
-                for i, kp in enumerate(keypoints):
-                    x, y, conf = kp
-                    if conf > 0.3:
-                        cv2.circle(frame, (int(x), int(y)), 4, color, -1)
-                
-                connections = [
-                    (5, 6), (5, 7), (7, 9), (6, 8), (8, 10),
-                    (5, 11), (6, 12), (11, 12),
-                    (11, 13), (13, 15), (12, 14), (14, 16)
-                ]
-                
-                for start, end in connections:
-                    if (keypoints[start, 2] > 0.3 and keypoints[end, 2] > 0.3):
-                        pt1 = (int(keypoints[start, 0]), int(keypoints[start, 1]))
-                        pt2 = (int(keypoints[end, 0]), int(keypoints[end, 1]))
-                        cv2.line(frame, pt1, pt2, color, 2)
+            # Draw label background
+            label_size, _ = cv2.getTextSize(label, cv2.FONT_HERSHEY_SIMPLEX, 0.6, 2)
+            cv2.rectangle(frame, (x1, y1 - label_size[1] - 10), (x1 + label_size[0], y1), color, -1)
             
-            # Draw label
-            label_y = max(y1 - 10, 20)
-            
-            if status == "tracking_only":
-                if is_fallen:
-                    label = f"ID:{track_id} | ⚠ FALLEN (Tracking) ⚠"
-                else:
-                    label = f"ID:{track_id} | Tracking ({detection['visible_count']}/10 kpts)"
-            elif status == "classified":
-                if is_fallen:
-                    label = f"ID:{track_id} | ⚠ {class_name} ⚠"
-                else:
-                    label = f"ID:{track_id} | {class_name} ({confidence*100:.0f}%)"
-            else:
-                label = f"ID:{track_id} | Unknown"
-            
-            (label_w, label_h), _ = cv2.getTextSize(label, cv2.FONT_HERSHEY_SIMPLEX, 0.6, 2)
-            cv2.rectangle(frame, (x1, label_y - label_h - 8), (x1 + label_w + 10, label_y + 2), color, -1)
-            cv2.putText(frame, label, (x1 + 5, label_y - 5),
+            # Draw label text
+            cv2.putText(frame, label, (x1, y1 - 5),
                        cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 2)
+            
+            # ========================================
+            # ENHANCED KEYPOINT AND SKELETON DRAWING
+            # ========================================
+            if prediction is not None:
+                # STEP 1: Draw skeleton lines FIRST (so they appear behind keypoints)
+                for start_idx, end_idx in skeleton_connections:
+                    if (keypoints[start_idx, 2] > 0.3 and keypoints[end_idx, 2] > 0.3):
+                        pt1 = (int(keypoints[start_idx, 0]), int(keypoints[start_idx, 1]))
+                        pt2 = (int(keypoints[end_idx, 0]), int(keypoints[end_idx, 1]))
+                        
+                        # Draw thicker lines with slight transparency effect
+                        # Main line (thicker, colored)
+                        cv2.line(frame, pt1, pt2, color, thickness=4, lineType=cv2.LINE_AA)
+                        
+                        # Inner line (thinner, brighter) for contrast
+                        line_color_bright = tuple(min(c + 50, 255) for c in color)
+                        cv2.line(frame, pt1, pt2, line_color_bright, thickness=2, lineType=cv2.LINE_AA)
+                
+                # STEP 2: Draw keypoints ON TOP of lines
+                for i, kp in enumerate(keypoints):
+                    x_kp, y_kp, conf = kp
+                    if conf > 0.3:
+                        kp_pos = (int(x_kp), int(y_kp))
+                        
+                        # Draw outer circle (darker border for contrast)
+                        cv2.circle(frame, kp_pos, 8, (0, 0, 0), -1, lineType=cv2.LINE_AA)
+                        
+                        # Draw main keypoint circle (colored)
+                        cv2.circle(frame, kp_pos, 6, color, -1, lineType=cv2.LINE_AA)
+                        
+                        # Draw inner highlight (white dot for visibility)
+                        cv2.circle(frame, kp_pos, 3, (255, 255, 255), -1, lineType=cv2.LINE_AA)
         
         return frame
 
 
 # ============================================================================
-# FLASK APPLICATION
+# CAMERA & GLOBAL STATE
 # ============================================================================
 
 # Global variables
-detector = None
 camera = None
-camera_lock = __import__('threading').Lock()
 camera_initialized = False
+detector = None
 current_status = {
     'people_detected': 0,
     'detections': [],
     'fps': 0
 }
-status_lock = __import__('threading').Lock()
+
+# Thread safety
+import threading
+camera_lock = threading.Lock()
+status_lock = threading.Lock()
 
 
 def initialize_detector():
-    """Initialize the fall detector"""
+    """Initialize the fall detector (loads models)"""
     global detector
     try:
         detector = FallDetector()
-        print("✓ Fall detector initialized successfully")
+        print("✓ Detector initialized successfully")
         return True
     except Exception as e:
         print(f"✗ Error initializing detector: {e}")
@@ -544,80 +932,69 @@ def initialize_detector():
 
 
 def initialize_camera():
-    """Initialize camera with multiple attempts"""
+    """Initialize webcam with error handling"""
     global camera, camera_initialized
     
     with camera_lock:
-        if camera_initialized and camera is not None and camera.isOpened():
-            return True
-        
-        print("\n" + "="*60)
-        print("Initializing Camera...")
-        print("="*60)
-        
         if camera is not None:
-            try:
+            camera.release()
+        
+        try:
+            camera = cv2.VideoCapture(0)
+            
+            if not camera.isOpened():
+                print("✗ Failed to open webcam")
+                camera = None
+                camera_initialized = False
+                return False
+            
+            # Set camera properties
+            camera.set(cv2.CAP_PROP_FRAME_WIDTH, 1920)
+            camera.set(cv2.CAP_PROP_FRAME_HEIGHT, 1080)
+            camera.set(cv2.CAP_PROP_FPS, 30)
+            
+            # Test read
+            success, test_frame = camera.read()
+            if not success or test_frame is None:
+                print("✗ Camera opened but cannot read frames")
                 camera.release()
-            except:
-                pass
+                camera = None
+                camera_initialized = False
+                return False
+            
+            camera_initialized = True
+            print("✓ Camera initialized successfully")
+            return True
+            
+        except Exception as e:
+            print(f"✗ Error initializing camera: {e}")
             camera = None
-        
-        for cam_index in [0, 1, 2]:
-            print(f"Trying camera index {cam_index}...")
-            try:
-                cap = cv2.VideoCapture(cam_index, cv2.CAP_DSHOW)
-                
-                if not cap.isOpened():
-                    cap = cv2.VideoCapture(cam_index)
-                
-                if cap.isOpened():
-                    ret, frame = cap.read()
-                    if ret and frame is not None:
-                        print(f"✓ Camera {cam_index} opened successfully!")
-                        print(f"  Resolution: {frame.shape[1]}x{frame.shape[0]}")
-                        
-                        cap.set(cv2.CAP_PROP_FRAME_WIDTH, 1280)
-                        cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 720)
-                        cap.set(cv2.CAP_PROP_FPS, 30)
-                        cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
-                        
-                        camera = cap
-                        camera_initialized = True
-                        print("="*60 + "\n")
-                        return True
-                    else:
-                        print(f"  Camera {cam_index} opened but couldn't read frame")
-                        cap.release()
-                else:
-                    print(f"  Camera {cam_index} not available")
-                    
-            except Exception as e:
-                print(f"  Error with camera {cam_index}: {e}")
-        
-        print("✗ Failed to initialize any camera")
-        print("="*60 + "\n")
-        return False
+            camera_initialized = False
+            return False
 
 
 def generate_frames():
-    """Generate frames with pose detection and tracking"""
-    global current_status, camera
+    """Generator function for video streaming"""
+    global camera, camera_initialized
     
-    if not initialize_camera():
-        print("✗ Camera initialization failed, sending error frame")
-        error_frame = np.zeros((480, 640, 3), dtype=np.uint8)
-        cv2.putText(error_frame, "Camera Not Available", (120, 240),
-                   cv2.FONT_HERSHEY_SIMPLEX, 1.2, (0, 0, 255), 3)
-        cv2.putText(error_frame, "Please check camera connection", (80, 300),
-                   cv2.FONT_HERSHEY_SIMPLEX, 0.8, (255, 255, 255), 2)
-        
-        ret, buffer = cv2.imencode('.jpg', error_frame)
-        frame_bytes = buffer.tobytes()
-        
-        while True:
-            yield (b'--frame\r\n'
-                   b'Content-Type: image/jpeg\r\n\r\n' + frame_bytes + b'\r\n')
-            time.sleep(1)
+    if not camera_initialized:
+        print("⚠ Camera not initialized, attempting to initialize...")
+        if not initialize_camera():
+            print("✗ Camera initialization failed, sending error frame...")
+            
+            error_frame = np.zeros((480, 640, 3), dtype=np.uint8)
+            cv2.putText(error_frame, "Camera Unavailable", (150, 240),
+                       cv2.FONT_HERSHEY_SIMPLEX, 1.2, (0, 0, 255), 3)
+            cv2.putText(error_frame, "Please check camera connection", (80, 300),
+                       cv2.FONT_HERSHEY_SIMPLEX, 0.8, (255, 255, 255), 2)
+            
+            ret, buffer = cv2.imencode('.jpg', error_frame)
+            frame_bytes = buffer.tobytes()
+            
+            while True:
+                yield (b'--frame\r\n'
+                       b'Content-Type: image/jpeg\r\n\r\n' + frame_bytes + b'\r\n')
+                time.sleep(1)
     
     print("✓ Starting frame generation (inference logic + multi-person tracking)...")
     frame_count = 0
@@ -722,7 +1099,7 @@ def health():
         'status': 'healthy',
         'detector_loaded': detector is not None,
         'camera_available': cam_available,
-        'model_type': 'EnhancedSpatial1DCNN (Inference Logic)'
+        'model_type': 'EnhancedSpatial1DCNN (Fixed Temporal Activation)'
     })
 
 
@@ -822,7 +1199,7 @@ def clear_all_incidents():
 
 if __name__ == '__main__':
     print("\n" + "="*60)
-    print("CAIretaker Backend - Inference Logic + Multi-Person Tracking")
+    print("CAIretaker Backend - Fixed Temporal Activation")
     print("="*60)
     
     if initialize_detector():
