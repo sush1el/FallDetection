@@ -1,63 +1,94 @@
-import React, { useState } from 'react';
-import { Card, Table, Button, DatePicker, Select, Input, Space } from 'antd';
-import { ReloadOutlined, ClearOutlined, SearchOutlined, DownloadOutlined } from '@ant-design/icons';
+import React, { useState, useEffect } from 'react';
+import { Card, Table, Button, Select, Input, Space, Tag, message, Modal, Popconfirm } from 'antd';
+import { 
+  ReloadOutlined, 
+  ClearOutlined, 
+  SearchOutlined, 
+  DownloadOutlined,
+  ExclamationCircleOutlined,
+  DeleteOutlined
+} from '@ant-design/icons';
 import './Logs.css';
 
-const { RangePicker } = DatePicker;
 const { Option } = Select;
+const { confirm } = Modal;
+
+const BACKEND_URL = 'http://localhost:5000';
 
 const Logs = () => {
-  const [logs, setLogs] = useState([
-    {
-      key: '1',
-      date: '2025-10-25',
-      time: '15:20',
-      location: 'Hallway',
-      status: 'Fall Detected (Active)',
-      severity: 'Critical',
-      response: 'Alert Sent',
-    },
-    {
-      key: '2',
-      date: '2025-10-26',
-      time: '15:20',
-      location: 'Room 208',
-      status: 'Fall Detected (Active)',
-      severity: 'Critical',
-      response: 'Alert Sent',
-    },
-    {
-      key: '3',
-      date: '2025-10-26',
-      time: '15:20',
-      location: 'Room 310',
-      status: 'Normal',
-      severity: 'Low',
-      response: 'None',
-    },
-    {
-      key: '4',
-      date: '2025-10-26',
-      time: '10:90',
-      location: 'Room 111',
-      status: 'Normal',
-      severity: 'Low',
-      response: 'None',
-    },
-    {
-      key: '5',
-      date: '2025-10-24',
-      time: '09:15',
-      location: 'Kitchen',
-      status: 'Fall Detected (Resolved)',
-      severity: 'Medium',
-      response: 'Staff Responded',
-    },
-  ]);
+  const [logs, setLogs] = useState([]);
+  const [filteredLogs, setFilteredLogs] = useState([]);
+  const [loading, setLoading] = useState(false);
+  const [statusFilter, setStatusFilter] = useState('all');
+  const [searchTerm, setSearchTerm] = useState('');
 
-  const [filteredLogs, setFilteredLogs] = useState(logs);
+  // Fetch incidents from database
+  const fetchIncidents = async () => {
+    setLoading(true);
+    try {
+      const statusParam = statusFilter !== 'all' ? `?status=${statusFilter}` : '';
+      const response = await fetch(`${BACKEND_URL}/incidents${statusParam}`);
+      const data = await response.json();
+      
+      if (data.success) {
+        const formattedLogs = data.incidents.map(incident => ({
+          key: incident.id,
+          id: incident.id,
+          date: incident.date,
+          time: incident.time,
+          location: incident.location,
+          timestamp: incident.timestamp,
+          resolved_at: incident.resolved_at,
+        }));
+        
+        setLogs(formattedLogs);
+        setFilteredLogs(formattedLogs);
+        message.success(`Loaded ${formattedLogs.length} incidents`);
+      } else {
+        message.error('Failed to fetch incidents');
+      }
+    } catch (error) {
+      console.error('Error fetching incidents:', error);
+      message.error('Failed to connect to backend');
+    } finally {
+      setLoading(false);
+    }
+  };
+
+  // Initial load
+  useEffect(() => {
+    fetchIncidents();
+    
+    // Auto-refresh every 5 seconds
+    const interval = setInterval(() => {
+      fetchIncidents();
+    }, 5000);
+    
+    return () => clearInterval(interval);
+  }, [statusFilter]);
+
+  // Search filter
+  useEffect(() => {
+    if (searchTerm) {
+      const filtered = logs.filter(log => 
+        log.location.toLowerCase().includes(searchTerm.toLowerCase()) ||
+        log.date.includes(searchTerm) ||
+        log.time.includes(searchTerm)
+      );
+      setFilteredLogs(filtered);
+    } else {
+      setFilteredLogs(logs);
+    }
+  }, [searchTerm, logs]);
 
   const columns = [
+    {
+      title: 'Incident ID',
+      dataIndex: 'id',
+      key: 'id',
+      width: 120,
+      render: (id) => <Tag color="blue">#{id}</Tag>
+    },
     {
       title: 'Date',
       dataIndex: 'date',
@@ -73,108 +104,134 @@ const Logs = () => {
       title: 'Location',
       dataIndex: 'location',
       key: 'location',
-      filters: [
-        { text: 'Hallway', value: 'Hallway' },
-        { text: 'Room 208', value: 'Room 208' },
-        { text: 'Room 310', value: 'Room 310' },
-        { text: 'Room 111', value: 'Room 111' },
-        { text: 'Kitchen', value: 'Kitchen' },
-      ],
-      onFilter: (value, record) => record.location.includes(value),
     },
     {
-      title: 'Status',
-      dataIndex: 'status',
-      key: 'status',
-      render: (status) => (
-        <span className={status.includes('Fall') ? 'status-fall' : 'status-normal'}>
-          {status}
-        </span>
+      title: 'Actions',
+      key: 'actions',
+      width: 120,
+      render: (_, record) => (
+        <Popconfirm
+          title="Delete this incident?"
+          description="This action cannot be undone."
+          onConfirm={() => handleDelete(record.id)}
+          okText="Delete"
+          cancelText="Cancel"
+          okButtonProps={{ danger: true }}
+        >
+          <Button 
+            size="small" 
+            danger
+            icon={<DeleteOutlined />}
+          >
+            Delete
+          </Button>
+        </Popconfirm>
       ),
-      filters: [
-        { text: 'Fall Detected', value: 'Fall' },
-        { text: 'Normal', value: 'Normal' },
-      ],
-      onFilter: (value, record) => record.status.includes(value),
-    },
-    {
-      title: 'Severity',
-      dataIndex: 'severity',
-      key: 'severity',
-      render: (severity) => (
-        <span className={`severity-${severity.toLowerCase()}`}>
-          {severity}
-        </span>
-      ),
-    },
-    {
-      title: 'Response',
-      dataIndex: 'response',
-      key: 'response',
     },
   ];
 
   const handleRefresh = () => {
-    console.log('Refreshing logs...');
-    setFilteredLogs([...logs]);
+    fetchIncidents();
   };
 
-  const handleClear = () => {
-    setLogs([]);
-    setFilteredLogs([]);
+  const handleDelete = async (incidentId) => {
+    try {
+      const response = await fetch(`${BACKEND_URL}/incidents/${incidentId}`, {
+        method: 'DELETE'
+      });
+      const data = await response.json();
+      
+      if (data.success) {
+        message.success('Incident deleted successfully');
+        fetchIncidents();
+      } else {
+        message.error('Failed to delete incident');
+      }
+    } catch (error) {
+      console.error('Error deleting incident:', error);
+      message.error('Failed to delete incident');
+    }
+  };
+
+  const handleClearAll = () => {
+    confirm({
+      title: 'Are you sure you want to clear all incidents?',
+      icon: <ExclamationCircleOutlined />,
+      content: 'This action cannot be undone. All incident records will be permanently deleted.',
+      okText: 'Yes, Clear All',
+      okType: 'danger',
+      cancelText: 'Cancel',
+      onOk: async () => {
+        try {
+          const response = await fetch(`${BACKEND_URL}/incidents/clear`, {
+            method: 'POST'
+          });
+          const data = await response.json();
+          
+          if (data.success) {
+            message.success('All incidents cleared');
+            setLogs([]);
+            setFilteredLogs([]);
+          } else {
+            message.error('Failed to clear incidents');
+          }
+        } catch (error) {
+          console.error('Error clearing incidents:', error);
+          message.error('Failed to clear incidents');
+        }
+      },
+    });
   };
 
   const handleExport = () => {
-    // Convert logs to CSV format
-    const headers = ['Date', 'Time', 'Location', 'Status', 'Severity', 'Response'];
+    const headers = ['Incident ID', 'Date', 'Time', 'Location'];
     const csvData = [
       headers.join(','),
       ...filteredLogs.map(log => 
-        [log.date, log.time, log.location, log.status, log.severity, log.response].join(',')
+        [log.id, log.date, log.time, log.location].join(',')
       )
     ].join('\n');
 
-    // Create blob and download
     const blob = new Blob([csvData], { type: 'text/csv;charset=utf-8;' });
     const link = document.createElement('a');
     const url = URL.createObjectURL(blob);
     
     link.setAttribute('href', url);
-    link.setAttribute('download', `incident-logs-${new Date().toISOString().split('T')[0]}.csv`);
+    link.setAttribute('download', `fall-incidents-${new Date().toISOString().split('T')[0]}.csv`);
     link.style.visibility = 'hidden';
     
     document.body.appendChild(link);
     link.click();
     document.body.removeChild(link);
     
-    console.log('Logs exported successfully!');
+    message.success('Incidents exported successfully!');
   };
 
   return (
     <div className="logs-container">
       <Card 
-        title={<h2>Incident Logs</h2>}
+        title={<h2>Fall Incident Logs</h2>}
         className="logs-card"
       >
         {/* Filters and Actions */}
         <div className="logs-header">
           <Space wrap style={{ marginBottom: 16 }}>
             <Input
-              placeholder="Search logs..."
+              placeholder="Search by location, date..."
               prefix={<SearchOutlined />}
-              style={{ width: 200 }}
+              style={{ width: 300 }}
+              value={searchTerm}
+              onChange={(e) => setSearchTerm(e.target.value)}
             />
-            <RangePicker />
-            <Select defaultValue="all" style={{ width: 150 }}>
-              <Option value="all">All Locations</Option>
-              <Option value="hallway">Hallway</Option>
-              <Option value="room">Rooms</Option>
-              <Option value="kitchen">Kitchen</Option>
-            </Select>
-            <Select defaultValue="all" style={{ width: 150 }}>
+            
+            <Select 
+              value={statusFilter} 
+              onChange={setStatusFilter}
+              style={{ width: 150 }}
+            >
               <Option value="all">All Status</Option>
-              <Option value="fall">Fall Detected</Option>
-              <Option value="normal">Normal</Option>
+              <Option value="Active">Active Falls</Option>
+              <Option value="Resolved">Resolved Falls</Option>
             </Select>
           </Space>
 
@@ -184,17 +241,18 @@ const Logs = () => {
               onClick={handleExport}
               type="primary"
             >
-              Export
+              Export CSV
             </Button>
             <Button 
               icon={<ReloadOutlined />} 
               onClick={handleRefresh}
+              loading={loading}
             >
               Refresh
             </Button>
             <Button 
               icon={<ClearOutlined />} 
-              onClick={handleClear}
+              onClick={handleClearAll}
               danger
             >
               Clear All
@@ -206,11 +264,13 @@ const Logs = () => {
         <Table 
           columns={columns} 
           dataSource={filteredLogs} 
+          loading={loading}
           pagination={{ 
             pageSize: 10,
             showSizeChanger: true,
-            showTotal: (total) => `Total ${total} logs`
+            showTotal: (total) => `Total ${total} incidents`
           }}
+          scroll={{ x: 800 }}
         />
       </Card>
     </div>

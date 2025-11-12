@@ -7,7 +7,8 @@ import {
   CameraOutlined,
   WifiOutlined,
   UserOutlined,
-  TeamOutlined
+  TeamOutlined,
+  CheckCircleOutlined
 } from '@ant-design/icons';
 import './Dashboard.css';
 
@@ -15,44 +16,13 @@ const BACKEND_URL = 'http://localhost:5000';
 
 const Dashboard = () => {
   const imageRef = React.useRef(null);
-
+  const [videoFeedLoaded, setVideoFeedLoaded] = useState(false);
   const [isLive, setIsLive] = useState(false);
   const [backendStatus, setBackendStatus] = useState({
     people_detected: 0,
     detections: [],
     fps: 0
   });
-  
-  const [incidentLogs, setIncidentLogs] = useState([
-    {
-      key: '1',
-      date: '2025-10-25',
-      time: '15:20',
-      location: 'Hallway',
-      status: 'Fall Detected (Active)',
-    },
-    {
-      key: '2',
-      date: '2025-10-26',
-      time: '15:20',
-      location: 'Room 208',
-      status: 'Fall Detected (Active)',
-    },
-    {
-      key: '3',
-      date: '2025-10-26',
-      time: '15:20',
-      location: 'Room 310',
-      status: 'Normal',
-    },
-    {
-      key: '4',
-      date: '2025-10-26',
-      time: '10:90',
-      location: 'Room 111',
-      status: 'Normal',
-    },
-  ]);
 
   const [liveAlerts, setLiveAlerts] = useState([]);
   const [camerasActive, setCamerasActive] = useState(0);
@@ -60,14 +30,31 @@ const Dashboard = () => {
   const [peopleDetected, setPeopleDetected] = useState(0);
   const [detectedPeople, setDetectedPeople] = useState([]);
   const [lastUpdate, setLastUpdate] = useState(new Date());
+  const [recentIncidents, setRecentIncidents] = useState([]);
 
-  // Force video feed request on mount to ensure camera starts
-  useEffect(() => {
-    if (isLive && imageRef.current) {
-      // Force reload the image source to trigger video feed
-      imageRef.current.src = `${BACKEND_URL}/video_feed?t=${Date.now()}`;
+  // Track which person IDs we've already alerted for
+  const alertedFallsRef = React.useRef(new Set());
+
+  // Fetch recent incidents
+  const fetchRecentIncidents = async () => {
+    try {
+      const response = await fetch(`${BACKEND_URL}/incidents?limit=10`);
+      const data = await response.json();
+      
+      if (data.success) {
+        const formatted = data.incidents.map(incident => ({
+          key: incident.id,
+          id: incident.id,
+          date: incident.date,
+          time: incident.time,
+          location: incident.location,
+        }));
+        setRecentIncidents(formatted);
+      }
+    } catch (error) {
+      console.error('Error fetching recent incidents:', error);
     }
-  }, [isLive]);
+  };
 
   // Check backend health
   useEffect(() => {
@@ -90,6 +77,22 @@ const Dashboard = () => {
     return () => clearInterval(interval);
   }, []);
 
+  // Fetch recent incidents
+  useEffect(() => {
+    fetchRecentIncidents();
+    const interval = setInterval(fetchRecentIncidents, 5000);
+    return () => clearInterval(interval);
+  }, []);
+
+  // Trigger video feed load when backend is ready
+  useEffect(() => {
+    if (isConnected && !videoFeedLoaded && imageRef.current) {
+      console.log('Backend connected, starting video feed...');
+      imageRef.current.src = `${BACKEND_URL}/video_feed?t=${Date.now()}`;
+      setVideoFeedLoaded(true);
+    }
+  }, [isConnected, videoFeedLoaded]);
+
   // Fetch detection status
   useEffect(() => {
     const fetchStatus = async () => {
@@ -102,41 +105,30 @@ const Dashboard = () => {
         setDetectedPeople(data.detections || []);
         setLastUpdate(new Date());
         
-        // Check for falls in any detected person
-        const fallDetected = data.detections?.some(d => d.is_fall) || false;
-        
-        if (fallDetected) {
-          const fallPerson = data.detections.find(d => d.is_fall);
-          const newAlert = {
-            id: Date.now(),
-            message: `FALL DETECTED - Person ID: ${fallPerson.id} - ${new Date().toLocaleTimeString()}`,
-            time: new Date()
-          };
-          
-          setLiveAlerts(prev => {
-            const updated = [newAlert, ...prev];
-            return updated.slice(0, 10);
-          });
-          
-          const newLog = {
-            key: `log-${Date.now()}`,
-            date: new Date().toLocaleDateString(),
-            time: new Date().toLocaleTimeString(),
-            location: `Live Camera - Person ID: ${fallPerson.id}`,
-            status: 'Fall Detected (Active)',
-          };
-          
-          setIncidentLogs(prev => {
-            const recentFall = prev.find(log => 
-              log.location.includes(`Person ID: ${fallPerson.id}`) && 
-              log.status.includes('Fall') &&
-              Math.abs(new Date() - new Date(`${log.date} ${log.time}`)) < 10000
-            );
-            
-            if (!recentFall) {
-              return [newLog, ...prev];
+        // Check for NEW falls (not already alerted)
+        if (data.detections) {
+          data.detections.forEach(person => {
+            if (person.is_fall && person.incident_id) {
+              // Only alert if we haven't alerted for this incident ID before
+              if (!alertedFallsRef.current.has(person.incident_id)) {
+                const newAlert = {
+                  id: person.incident_id,
+                  person_id: person.id,
+                  message: `FALL DETECTED - Person ID: ${person.id} - Incident #${person.incident_id}`,
+                  time: new Date()
+                };
+                
+                setLiveAlerts(prev => {
+                  const updated = [newAlert, ...prev];
+                  return updated.slice(0, 10);
+                });
+                
+                // Mark this incident as alerted
+                alertedFallsRef.current.add(person.incident_id);
+                
+                console.log(`🚨 NEW FALL ALERT: Person ${person.id}, Incident #${person.incident_id}`);
+              }
             }
-            return prev;
           });
         }
       } catch (error) {
@@ -148,42 +140,24 @@ const Dashboard = () => {
     return () => clearInterval(interval);
   }, []);
 
-  const columns = [
-    {
-      title: 'Date',
-      dataIndex: 'date',
-      key: 'date',
-    },
-    {
-      title: 'Time',
-      dataIndex: 'time',
-      key: 'time',
-    },
-    {
-      title: 'Location',
-      dataIndex: 'location',
-      key: 'location',
-    },
-    {
-      title: 'Status',
-      dataIndex: 'status',
-      key: 'status',
-      render: (status) => (
-        <span className={status.includes('Fall') ? 'status-fall' : 'status-normal'}>
-          {status}
-        </span>
-      ),
-    },
-  ];
-
   const handleRefresh = () => {
     setLastUpdate(new Date());
-    console.log('Refreshing incident logs...');
+    // Force refresh video feed
+    if (imageRef.current && isConnected) {
+      setVideoFeedLoaded(false);
+      setTimeout(() => {
+        if (imageRef.current) {
+          imageRef.current.src = `${BACKEND_URL}/video_feed?t=${Date.now()}`;
+          setVideoFeedLoaded(true);
+        }
+      }, 100);
+    }
+    console.log('Refreshing dashboard...');
   };
 
-  const handleClear = () => {
-    setIncidentLogs([]);
+  const handleClearAlerts = () => {
     setLiveAlerts([]);
+    alertedFallsRef.current.clear();
   };
 
   const getStatusColor = (status) => {
@@ -191,6 +165,23 @@ const Dashboard = () => {
     if (status === 'Sitting') return 'orange';
     if (status === 'Standing') return 'green';
     return 'default';
+  };
+
+  const handleResolveIncident = async (incidentId) => {
+    try {
+      const response = await fetch(`${BACKEND_URL}/incidents/${incidentId}/resolve`, {
+        method: 'POST'
+      });
+      const data = await response.json();
+      
+      if (data.success) {
+        console.log(`Incident ${incidentId} resolved`);
+        // Remove from alerts
+        setLiveAlerts(prev => prev.filter(alert => alert.id !== incidentId));
+      }
+    } catch (error) {
+      console.error('Error resolving incident:', error);
+    }
   };
 
   return (
@@ -207,19 +198,23 @@ const Dashboard = () => {
               />
             </div>
             <div className="webcam-display">
-              {isLive ? (
+              {isConnected ? (
                 <img 
                   ref={imageRef}
-                  src={`${BACKEND_URL}/video_feed?t=${Date.now()}`}
                   alt="AI-Processed Video Feed"
                   className="webcam-video"
                   onError={(e) => {
-                    console.log('Video feed error, retrying in 2 seconds...');
+                    console.log('Video feed error, retrying in 3 seconds...');
                     setTimeout(() => {
-                      e.target.src = `${BACKEND_URL}/video_feed?t=${Date.now()}`;
-                    }, 2000);
+                      if (e.target) {
+                        e.target.src = `${BACKEND_URL}/video_feed?t=${Date.now()}`;
+                      }
+                    }, 3000);
                   }}
-                  onLoad={() => console.log('Video feed loaded successfully')}
+                  onLoad={() => {
+                    console.log('Video feed loaded successfully');
+                    setIsLive(true);
+                  }}
                   style={{ width: '100%', height: 'auto', display: 'block' }}
                 />
               ) : (
@@ -239,13 +234,14 @@ const Dashboard = () => {
             </div>
           </Card>
 
-          {/* Detected People Table */}
-          {detectedPeople.length > 0 && (
-            <Card 
-              title="Currently Detected People" 
-              style={{ marginTop: 16 }}
-              className="incident-log-card"
-            >
+          {/* Currently Detected People */}
+          <Card 
+            title="Live Monitoring" 
+            style={{ marginTop: 16 }}
+            className="incident-log-card"
+            extra={<Badge count={detectedPeople.length} showZero />}
+          >
+            {detectedPeople.length > 0 ? (
               <Table 
                 dataSource={detectedPeople.map(p => ({ ...p, key: p.id }))}
                 pagination={false}
@@ -271,60 +267,68 @@ const Dashboard = () => {
                     title: 'Alert',
                     dataIndex: 'is_fall',
                     key: 'is_fall',
-                    render: (isFall) => 
+                    render: (isFall, record) => 
                       isFall ? (
-                        <Tag color="red" icon={<WarningOutlined />}>FALL DETECTED</Tag>
+                        <div style={{ display: 'flex', alignItems: 'center', gap: 8 }}>
+                          <Tag color="red" icon={<WarningOutlined />}>
+                            FALLEN - Incident #{record.incident_id}
+                          </Tag>
+                          <Button 
+                            size="small" 
+                            type="primary"
+                            icon={<CheckCircleOutlined />}
+                            onClick={() => handleResolveIncident(record.incident_id)}
+                          >
+                            Resolve
+                          </Button>
+                        </div>
                       ) : (
                         <Tag color="success">Normal</Tag>
                       )
                   }
                 ]}
               />
-            </Card>
-          )}
-
-          {/* Incident Log */}
-          <Card 
-            title="Incident Log" 
-            className="incident-log-card"
-            style={{ marginTop: 16 }}
-            extra={
-              <div className="log-actions">
-                <Button 
-                  icon={<ReloadOutlined />} 
-                  onClick={handleRefresh}
-                  className="action-button refresh-button"
-                >
-                  Refresh
-                </Button>
-                <Button 
-                  icon={<ClearOutlined />} 
-                  onClick={handleClear}
-                  className="action-button clear-button"
-                >
-                  Clear
-                </Button>
+            ) : (
+              <div style={{ textAlign: 'center', padding: 20, color: '#999' }}>
+                No people detected in frame
               </div>
-            }
-          >
-            <Table 
-              columns={columns} 
-              dataSource={incidentLogs} 
-              pagination={false}
-              size="small"
-            />
+            )}
           </Card>
         </Col>
 
         <Col xs={24} lg={10}>
           {/* Live Alerts */}
-          <Card title="Live Alerts" className="alerts-card">
+          <Card 
+            title="Live Fall Alerts" 
+            className="alerts-card"
+            extra={
+              <Button 
+                size="small" 
+                icon={<ClearOutlined />} 
+                onClick={handleClearAlerts}
+              >
+                Clear
+              </Button>
+            }
+          >
             <div className="alerts-container">
               {liveAlerts.length > 0 ? (
                 liveAlerts.map((alert) => (
                   <Alert
                     key={alert.id}
-                    message={alert.message}
+                    message={
+                      <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center' }}>
+                        <span>{alert.message}</span>
+                        <Button 
+                          size="small" 
+                          type="link"
+                          onClick={() => handleResolveIncident(alert.id)}
+                        >
+                          Dismiss
+                        </Button>
+                      </div>
+                    }
+                    description={alert.time.toLocaleString()}
                     type="error"
                     icon={<WarningOutlined />}
                     showIcon
@@ -333,15 +337,75 @@ const Dashboard = () => {
                 ))
               ) : (
                 <Alert
-                  message="No Recent Alerts"
+                  message="No Active Fall Alerts"
                   description="System is monitoring for falls. All clear."
                   type="success"
                   showIcon
                 />
               )}
-              <div className="last-update">
-                Last Update Status: {lastUpdate.toLocaleTimeString()}
-              </div>
+              
+            </div>
+          </Card>
+
+          {/* Recent Logs */}
+          <Card 
+            title= "Recent Logs" 
+            style={{ marginTop: 16 }}
+            extra={
+              <Button 
+                size="small" 
+                icon={<ReloadOutlined />} 
+                onClick={fetchRecentIncidents}
+              >
+                Refresh
+              </Button>
+            }
+          >
+            
+            <div style={{ maxHeight: 300, overflowY: 'auto' }}>
+              {recentIncidents.length > 0 ? (
+                <Table 
+                  dataSource={recentIncidents}
+                  pagination={false}
+                  size="small"
+                  showHeader={true}
+                  columns={[
+                    {
+                      title: 'ID',
+                      dataIndex: 'id',
+                      key: 'id',
+                      width: 60,
+                      render: (id) => <Tag color="blue">#{id}</Tag>
+                    },
+                    {
+                      title: 'Date',
+                      dataIndex: 'date',
+                      key: 'date',
+                      width: 100,
+                    },
+                    {
+                      title: 'Time',
+                      dataIndex: 'time',
+                      key: 'time',
+                      width: 80,
+                    },
+                    {
+                      title: 'Location',
+                      dataIndex: 'location',
+                      key: 'location',
+                      ellipsis: true,
+                    }
+                  ]}
+                />
+              ) : (
+                <div style={{ textAlign: 'center', padding: 20, color: '#999' }}>
+                  No incidents recorded yet
+                </div>,
+                <div className="last-update">
+                Last Update: {lastUpdate.toLocaleTimeString()}
+                </div>
+                
+              )}
             </div>
           </Card>
 

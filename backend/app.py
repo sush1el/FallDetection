@@ -1,9 +1,9 @@
 """
-Flask Backend for CAIretaker - Real-time Fall Detection with Multi-Person Tracking
-Integrates YOLOv8 pose detection with bounding boxes and tracking IDs
+Flask Backend for CAIretaker - Real-time Fall Detection with Database Logging
+Tracks fall incidents per person and logs to database
 """
 
-from flask import Flask, Response, jsonify
+from flask import Flask, Response, jsonify, request
 from flask_cors import CORS
 import cv2
 import numpy as np
@@ -14,6 +14,7 @@ import time
 from collections import deque, defaultdict
 import warnings
 import os
+from database import get_database
 
 warnings.filterwarnings('ignore')
 
@@ -22,9 +23,9 @@ CORS(app)
 
 # Configuration
 class Config:
-    OUTPUT_DIR = "backend/spatial_branch_output"
+    OUTPUT_DIR = "backend\spatial_branch_output"
     CNN_MODEL_PATH = os.path.join(OUTPUT_DIR, "cnn1d_model.pth")
-    YOLO_MODEL = "yolo11m-pose.pt"
+    YOLO_MODEL = "yolo11n-pose.pt"
     CONFIDENCE_THRESHOLD = 0.5
     SMOOTHING_WINDOW = 5
     CLASS_NAMES = {0: "Standing", 1: "Sitting", 2: "Fallen"}
@@ -35,12 +36,10 @@ class Config:
     }
     NUM_KEYPOINTS = 17
     NUM_COORDS = 3
-    # Minimum confidence for keypoints to be considered valid
     KEYPOINT_MIN_CONFIDENCE = 0.3
-    # Minimum number of keypoints required for classification
     MIN_KEYPOINTS_REQUIRED = 10
-    # Critical keypoints that should be visible (hips, shoulders, knees)
-    CRITICAL_KEYPOINTS = [5, 6, 11, 12, 13, 14]  # shoulders, hips, knees
+    CRITICAL_KEYPOINTS = [5, 6, 11, 12, 13, 14]
+    LOCATION_NAME = "UAC - Exhibit"  # Customize per camera
 
 
 # 1D-CNN Model Architecture
@@ -123,60 +122,35 @@ class FallDetector:
         # Prediction smoothing per track ID
         self.prediction_buffers = defaultdict(lambda: deque(maxlen=Config.SMOOTHING_WINDOW))
         
+        # Track fall states per person
+        # Format: {person_id: {'is_fallen': bool, 'incident_id': int or None}}
+        self.fall_states = {}
+        
+        # Database instance
+        self.db = get_database()
+        
     def check_keypoints_validity(self, keypoints):
         """Check if keypoints are sufficient for classification"""
         if len(keypoints) == 0:
             return False, "No keypoints detected"
         
-        # Count valid keypoints
         valid_keypoints = np.sum(keypoints[:, 2] > Config.KEYPOINT_MIN_CONFIDENCE)
         if valid_keypoints < Config.MIN_KEYPOINTS_REQUIRED:
             return False, f"Insufficient keypoints ({valid_keypoints}/{Config.MIN_KEYPOINTS_REQUIRED})"
         
-        # Check critical keypoints for sitting detection
-        # For sitting: we especially need hips (11,12) and knees (13,14) visible
         critical_valid = sum(1 for idx in Config.CRITICAL_KEYPOINTS 
                            if idx < len(keypoints) and keypoints[idx, 2] > Config.KEYPOINT_MIN_CONFIDENCE)
-        if critical_valid < len(Config.CRITICAL_KEYPOINTS) * 0.5:  # Reduced to 50% threshold
+        if critical_valid < len(Config.CRITICAL_KEYPOINTS) * 0.5:
             return False, f"Critical keypoints missing ({critical_valid}/{len(Config.CRITICAL_KEYPOINTS)})"
         
         return True, "Valid"
     
-    def get_pose_features(self, keypoints):
-        """Extract pose features for debugging and analysis"""
-        features = {}
-        
-        # Hip positions (11=left hip, 12=right hip)
-        if keypoints[11, 2] > 0.3 and keypoints[12, 2] > 0.3:
-            hip_y = (keypoints[11, 1] + keypoints[12, 1]) / 2
-            features['hip_y'] = hip_y
-        
-        # Knee positions (13=left knee, 14=right knee)
-        if keypoints[13, 2] > 0.3 and keypoints[14, 2] > 0.3:
-            knee_y = (keypoints[13, 1] + keypoints[14, 1]) / 2
-            features['knee_y'] = knee_y
-        
-        # Shoulder positions (5=left shoulder, 6=right shoulder)
-        if keypoints[5, 2] > 0.3 and keypoints[6, 2] > 0.3:
-            shoulder_y = (keypoints[5, 1] + keypoints[6, 1]) / 2
-            features['shoulder_y'] = shoulder_y
-        
-        # Calculate torso angle (indicator of sitting vs standing)
-        if 'shoulder_y' in features and 'hip_y' in features:
-            features['torso_height'] = abs(features['hip_y'] - features['shoulder_y'])
-        
-        # Calculate knee bend (sitting typically has bent knees)
-        if 'hip_y' in features and 'knee_y' in features:
-            features['hip_knee_distance'] = abs(features['knee_y'] - features['hip_y'])
-        
-        return features
-    
     def detect(self, frame):
         """Detect pose and classify activity with tracking"""
-        # Run YOLO pose detection with tracking
         results = self.pose_model.track(frame, persist=True, verbose=False, conf=0.5)
         
         detections = []
+        current_person_ids = set()
         
         if results and len(results) > 0:
             result = results[0]
@@ -185,25 +159,27 @@ class FallDetector:
                 keypoints_data = result.keypoints.data.cpu().numpy()
                 boxes = result.boxes
                 
-                # Get tracking IDs if available
                 track_ids = boxes.id.cpu().numpy().astype(int) if boxes.id is not None else None
                 
                 for idx, keypoints in enumerate(keypoints_data):
-                    # Get bounding box
                     box = boxes.xyxy[idx].cpu().numpy()
                     box_conf = boxes.conf[idx].cpu().numpy()
-                    
-                    # Get track ID or use index
                     track_id = int(track_ids[idx]) if track_ids is not None else idx
                     
-                    # Check if keypoints are valid for classification
+                    current_person_ids.add(track_id)
+                    
+                    # Initialize fall state for new person
+                    if track_id not in self.fall_states:
+                        self.fall_states[track_id] = {
+                            'is_fallen': False,
+                            'incident_id': None
+                        }
+                    
                     is_valid, validity_reason = self.check_keypoints_validity(keypoints)
                     
                     if is_valid and box_conf > 0.4:
-                        # Prepare input for CNN
                         keypoints_tensor = torch.FloatTensor(keypoints).unsqueeze(0).to(self.device)
                         
-                        # Classify pose
                         with torch.no_grad():
                             outputs = self.cnn_model(keypoints_tensor)
                             probabilities = torch.softmax(outputs, dim=1)
@@ -218,9 +194,30 @@ class FallDetector:
                             prediction = max(set(self.prediction_buffers[track_id]), 
                                            key=self.prediction_buffers[track_id].count)
                         
+                        # Check for fall state changes
+                        is_currently_fallen = (prediction == 2 and confidence > Config.CONFIDENCE_THRESHOLD)
+                        was_fallen = self.fall_states[track_id]['is_fallen']
+                        
+                        # NEW FALL DETECTED - Log it!
+                        if is_currently_fallen and not was_fallen:
+                            print(f"\n🚨 NEW FALL DETECTED: Person ID {track_id}")
+                            incident_id = self.db.log_fall_incident(
+                                person_id=track_id,
+                                confidence=confidence,
+                                location=Config.LOCATION_NAME
+                            )
+                            self.fall_states[track_id]['is_fallen'] = True
+                            self.fall_states[track_id]['incident_id'] = incident_id
+                        
+                        # RECOVERY DETECTED - Person stood up
+                        elif not is_currently_fallen and was_fallen:
+                            print(f"\n✅ RECOVERY: Person ID {track_id} stood up")
+                            self.db.resolve_fall_for_person(track_id)
+                            self.fall_states[track_id]['is_fallen'] = False
+                            self.fall_states[track_id]['incident_id'] = None
+                        
                         status = "classified"
                     else:
-                        # Don't classify, just show tracking
                         prediction = None
                         confidence = 0.0
                         status = "tracking_only"
@@ -234,8 +231,19 @@ class FallDetector:
                         'prediction': prediction,
                         'confidence': float(confidence),
                         'status': status,
-                        'reason': validity_reason if status == "tracking_only" else None
+                        'reason': validity_reason if status == "tracking_only" else None,
+                        'is_fallen': self.fall_states[track_id]['is_fallen'],
+                        'incident_id': self.fall_states[track_id].get('incident_id')
                     })
+        
+        # Clean up tracking for people who left the frame
+        disappeared_ids = set(self.fall_states.keys()) - current_person_ids
+        for person_id in disappeared_ids:
+            if self.fall_states[person_id]['is_fallen']:
+                print(f"⚠ Person ID {person_id} with active fall left frame")
+            del self.fall_states[person_id]
+            if person_id in self.prediction_buffers:
+                del self.prediction_buffers[person_id]
         
         return detections
     
@@ -248,27 +256,31 @@ class FallDetector:
             prediction = detection['prediction']
             confidence = detection['confidence']
             status = detection['status']
+            is_fallen = detection.get('is_fallen', False)
             
-            # Determine color based on prediction or default for tracking only
-            if status == "classified" and prediction is not None:
+            # Override color to red if person has an active fall incident
+            if is_fallen:
+                color = (0, 0, 255)  # Red for active fall
+                class_name = "FALLEN"
+            elif status == "classified" and prediction is not None:
                 color = Config.CLASS_COLORS.get(prediction, (255, 255, 255))
                 class_name = Config.CLASS_NAMES.get(prediction, "Unknown")
             else:
-                color = (128, 128, 128)  # Gray for tracking only
+                color = (128, 128, 128)
                 class_name = "Tracking"
             
-            # Draw bounding box
+            # Draw bounding box (thicker for fallen)
             x1, y1, x2, y2 = map(int, box)
-            cv2.rectangle(frame, (x1, y1), (x2, y2), color, 3)
+            thickness = 5 if is_fallen else 3
+            cv2.rectangle(frame, (x1, y1), (x2, y2), color, thickness)
             
-            # Draw keypoints (if valid)
+            # Draw keypoints
             if status == "classified":
                 for i, kp in enumerate(keypoints):
                     x, y, conf = kp
                     if conf > Config.KEYPOINT_MIN_CONFIDENCE:
                         cv2.circle(frame, (int(x), int(y)), 4, color, -1)
                 
-                # Draw skeleton connections
                 connections = [
                     (5, 6), (5, 7), (7, 9), (6, 8), (8, 10),
                     (5, 11), (6, 12), (11, 12),
@@ -282,21 +294,18 @@ class FallDetector:
                         pt2 = (int(keypoints[end, 0]), int(keypoints[end, 1]))
                         cv2.line(frame, pt1, pt2, color, 2)
             
-            # Draw ID and status label above box
+            # Draw label
             label_y = max(y1 - 10, 20)
             
-            if status == "classified":
+            if is_fallen:
+                label = f"ID:{track_id} | ⚠ {class_name} ⚠"
+            elif status == "classified":
                 label = f"ID:{track_id} | {class_name} ({confidence*100:.0f}%)"
             else:
                 label = f"ID:{track_id} | {class_name}"
             
-            # Get label size for background
             (label_w, label_h), _ = cv2.getTextSize(label, cv2.FONT_HERSHEY_SIMPLEX, 0.6, 2)
-            
-            # Draw background rectangle for label
             cv2.rectangle(frame, (x1, label_y - label_h - 8), (x1 + label_w + 10, label_y + 2), color, -1)
-            
-            # Draw label text
             cv2.putText(frame, label, (x1 + 5, label_y - 5),
                        cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 2)
         
@@ -439,14 +448,10 @@ def generate_frames():
             
             consecutive_failures = 0
             
-            # Detect and classify with tracking
             if detector is not None:
                 detections = detector.detect(frame)
-                
-                # Draw results
                 frame = detector.draw_results(frame, detections)
                 
-                # Update status
                 with status_lock:
                     current_status['people_detected'] = len(detections)
                     current_status['detections'] = [
@@ -454,12 +459,12 @@ def generate_frames():
                             'id': d['track_id'],
                             'status': Config.CLASS_NAMES.get(d['prediction'], 'Tracking') if d['status'] == 'classified' else 'Tracking',
                             'confidence': d['confidence'],
-                            'is_fall': d['prediction'] == 2 and d['confidence'] > Config.CONFIDENCE_THRESHOLD if d['status'] == 'classified' else False
+                            'is_fall': d.get('is_fallen', False),
+                            'incident_id': d.get('incident_id')
                         }
                         for d in detections
                     ]
                     
-                # Calculate FPS
                 frame_count += 1
                 if frame_count % 10 == 0:
                     current_time = time.time()
@@ -467,17 +472,10 @@ def generate_frames():
                     fps_time = current_time
                     current_status['fps'] = round(fps_value, 1)
                 
-                # Draw FPS
                 cv2.putText(frame, f"FPS: {fps_value:.1f}", 
                            (frame.shape[1] - 200, 40),
                            cv2.FONT_HERSHEY_SIMPLEX, 1.0, (255, 255, 255), 2)
-                
-                # Draw people count
-                cv2.putText(frame, f"People: {len(detections)}", 
-                           (20, 40),
-                           cv2.FONT_HERSHEY_SIMPLEX, 1.0, (255, 255, 255), 2)
             
-            # Encode frame
             ret, buffer = cv2.imencode('.jpg', frame, [cv2.IMWRITE_JPEG_QUALITY, 85])
             if not ret:
                 print("⚠ Frame encoding failed")
@@ -523,16 +521,119 @@ def health():
     })
 
 
+@app.route('/incidents', methods=['GET'])
+def get_incidents():
+    """Get fall incidents with optional filters"""
+    try:
+        db = get_database()
+        
+        status_filter = request.args.get('status')  # 'Active' or 'Resolved'
+        limit = int(request.args.get('limit', 100))
+        
+        if status_filter:
+            incidents = db.get_all_incidents(limit=limit, status=status_filter)
+        else:
+            incidents = db.get_all_incidents(limit=limit)
+        
+        return jsonify({
+            'success': True,
+            'incidents': incidents,
+            'count': len(incidents)
+        })
+    except Exception as e:
+        return jsonify({
+            'success': False,
+            'error': str(e)
+        }), 500
+
+
+@app.route('/incidents/statistics', methods=['GET'])
+def get_incident_statistics():
+    """Get incident statistics"""
+    try:
+        db = get_database()
+        stats = db.get_statistics()
+        return jsonify({
+            'success': True,
+            'statistics': stats
+        })
+    except Exception as e:
+        return jsonify({
+            'success': False,
+            'error': str(e)
+        }), 500
+
+
+@app.route('/incidents/<int:incident_id>/resolve', methods=['POST'])
+def resolve_incident(incident_id):
+    """Manually resolve an incident"""
+    try:
+        db = get_database()
+        db.resolve_fall_incident(incident_id)
+        return jsonify({
+            'success': True,
+            'message': f'Incident {incident_id} resolved'
+        })
+    except Exception as e:
+        return jsonify({
+            'success': False,
+            'error': str(e)
+        }), 500
+
+
+@app.route('/incidents/<int:incident_id>', methods=['DELETE'])
+def delete_incident(incident_id):
+    """Delete a specific incident"""
+    try:
+        db = get_database()
+        db.delete_incident(incident_id)
+        return jsonify({
+            'success': True,
+            'message': f'Incident {incident_id} deleted'
+        })
+    except Exception as e:
+        return jsonify({
+            'success': False,
+            'error': str(e)
+        }), 500
+
+
+@app.route('/incidents/clear', methods=['POST'])
+def clear_all_incidents():
+    """Clear all incidents from database"""
+    try:
+        db = get_database()
+        db.clear_all_incidents()
+        return jsonify({
+            'success': True,
+            'message': 'All incidents cleared'
+        })
+    except Exception as e:
+        return jsonify({
+            'success': False,
+            'error': str(e)
+        }), 500
+
+
 if __name__ == '__main__':
     print("\n" + "="*60)
-    print("CAIretaker Backend - Multi-Person Fall Detection with Tracking")
+    print("CAIretaker Backend - Fall Detection with Database Logging")
     print("="*60)
     
     if initialize_detector():
+        print("\nInitializing camera at startup...")
+        camera_success = initialize_camera()
+        
+        if not camera_success:
+            print("\n⚠ Warning: Camera initialization failed.")
+            print("  The system will continue to attempt camera connection.")
+            print("  Video feed will be available once camera is detected.\n")
+        
         print("\nStarting Flask server...")
         print("Backend will be available at: http://localhost:5000")
         print("Video feed: http://localhost:5000/video_feed")
         print("Status API: http://localhost:5000/status")
+        print("Incidents API: http://localhost:5000/incidents")
         print("="*60 + "\n")
         
         app.run(host='0.0.0.0', port=5000, debug=False, threaded=True)
