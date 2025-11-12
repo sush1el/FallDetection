@@ -1,6 +1,6 @@
 """
-Flask Backend for CAIretaker - Real-time Fall Detection with Database Logging
-Tracks fall incidents per person and logs to database
+Flask Backend for CAIretaker - Enhanced Fall Detection with Multi-Person Tracking
+Exact same detection logic as inference code + person tracking with IDs and database logging
 """
 
 from flask import Flask, Response, jsonify, request
@@ -24,10 +24,10 @@ CORS(app)
 # Configuration
 class Config:
     OUTPUT_DIR = "backend\spatial_branch_output"
-    CNN_MODEL_PATH = os.path.join(OUTPUT_DIR, "cnn1d_model.pth")
-    YOLO_MODEL = "yolo11n-pose.pt"
-    CONFIDENCE_THRESHOLD = 0.5
-    SMOOTHING_WINDOW = 5
+    CNN_MODEL_PATH = os.path.join(OUTPUT_DIR, "enhanced_cnn1d_model.pth")
+    YOLO_MODEL = "yolo11m-pose.pt"
+    CONFIDENCE_THRESHOLD = 0.65
+    SMOOTHING_WINDOW = 7
     CLASS_NAMES = {0: "Standing", 1: "Sitting", 2: "Fallen"}
     CLASS_COLORS = {
         0: (0, 255, 0),    # Standing - Green
@@ -36,57 +36,252 @@ class Config:
     }
     NUM_KEYPOINTS = 17
     NUM_COORDS = 3
-    KEYPOINT_MIN_CONFIDENCE = 0.3
-    MIN_KEYPOINTS_REQUIRED = 10
-    CRITICAL_KEYPOINTS = [5, 6, 11, 12, 13, 14]
-    LOCATION_NAME = "UAC - Exhibit"  # Customize per camera
+    NUM_SPATIAL_FEATURES = 7
+    LOCATION_NAME = "UAC - Exhibit"
 
 
-# 1D-CNN Model Architecture
-class Spatial1DCNN(nn.Module):
-    def __init__(self, input_channels=3, num_classes=3, dropout_rate=0.3):
-        super(Spatial1DCNN, self).__init__()
+# ============================================================================
+# ENHANCED MODEL ARCHITECTURE
+# ============================================================================
+
+class EnhancedSpatial1DCNN(nn.Module):
+    """Dual-branch architecture: CNN for keypoints + MLP for spatial features"""
+    def __init__(self, num_classes=3, dropout_rate=0.4):
+        super(EnhancedSpatial1DCNN, self).__init__()
         
-        self.conv1 = nn.Conv1d(in_channels=input_channels, out_channels=64, kernel_size=3, padding=1)
+        # Branch 1: CNN for keypoint sequences
+        self.conv1 = nn.Conv1d(in_channels=3, out_channels=64, kernel_size=3, padding=1)
         self.bn1 = nn.BatchNorm1d(64)
         self.relu1 = nn.ReLU()
         self.pool1 = nn.MaxPool1d(kernel_size=2)
+        self.dropout1 = nn.Dropout(0.2)
         
         self.conv2 = nn.Conv1d(in_channels=64, out_channels=128, kernel_size=3, padding=1)
         self.bn2 = nn.BatchNorm1d(128)
         self.relu2 = nn.ReLU()
         self.pool2 = nn.MaxPool1d(kernel_size=2)
+        self.dropout2 = nn.Dropout(0.2)
         
         self.conv3 = nn.Conv1d(in_channels=128, out_channels=256, kernel_size=3, padding=1)
         self.bn3 = nn.BatchNorm1d(256)
         self.relu3 = nn.ReLU()
+        self.dropout3 = nn.Dropout(0.3)
         
         self.global_pool = nn.AdaptiveAvgPool1d(1)
         
-        self.fc1 = nn.Linear(256, 128)
-        self.bn_fc1 = nn.BatchNorm1d(128)
-        self.relu_fc1 = nn.ReLU()
-        self.dropout1 = nn.Dropout(dropout_rate)
+        # Branch 2: MLP for spatial features
+        self.spatial_fc1 = nn.Linear(7, 32)
+        self.spatial_bn1 = nn.BatchNorm1d(32)
+        self.spatial_relu1 = nn.ReLU()
+        self.spatial_dropout1 = nn.Dropout(0.3)
         
-        self.fc2 = nn.Linear(128, 64)
-        self.bn_fc2 = nn.BatchNorm1d(64)
-        self.relu_fc2 = nn.ReLU()
-        self.dropout2 = nn.Dropout(dropout_rate)
+        self.spatial_fc2 = nn.Linear(32, 64)
+        self.spatial_bn2 = nn.BatchNorm1d(64)
+        self.spatial_relu2 = nn.ReLU()
+        self.spatial_dropout2 = nn.Dropout(0.3)
         
-        self.fc3 = nn.Linear(64, num_classes)
+        # Fusion layers
+        self.fusion_fc1 = nn.Linear(320, 128)
+        self.fusion_bn1 = nn.BatchNorm1d(128)
+        self.fusion_relu1 = nn.ReLU()
+        self.fusion_dropout1 = nn.Dropout(dropout_rate)
+        
+        self.fusion_fc2 = nn.Linear(128, 64)
+        self.fusion_bn2 = nn.BatchNorm1d(64)
+        self.fusion_relu2 = nn.ReLU()
+        self.fusion_dropout2 = nn.Dropout(dropout_rate)
+        
+        self.fc_out = nn.Linear(64, num_classes)
     
-    def forward(self, x):
-        x = x.permute(0, 2, 1)
-        x = self.pool1(self.relu1(self.bn1(self.conv1(x))))
-        x = self.pool2(self.relu2(self.bn2(self.conv2(x))))
-        x = self.relu3(self.bn3(self.conv3(x)))
-        x = self.global_pool(x)
-        x = x.squeeze(-1)
-        x = self.dropout1(self.relu_fc1(self.bn_fc1(self.fc1(x))))
-        x = self.dropout2(self.relu_fc2(self.bn_fc2(self.fc2(x))))
-        x = self.fc3(x)
-        return x
+    def forward(self, keypoints, spatial_features):
+        # Branch 1: CNN
+        x = keypoints.permute(0, 2, 1)
+        x = self.dropout1(self.pool1(self.relu1(self.bn1(self.conv1(x)))))
+        x = self.dropout2(self.pool2(self.relu2(self.bn2(self.conv2(x)))))
+        x = self.dropout3(self.relu3(self.bn3(self.conv3(x))))
+        x = self.global_pool(x).squeeze(-1)
+        
+        # Branch 2: MLP
+        s = self.spatial_dropout1(self.spatial_relu1(self.spatial_bn1(self.spatial_fc1(spatial_features))))
+        s = self.spatial_dropout2(self.spatial_relu2(self.spatial_bn2(self.spatial_fc2(s))))
+        
+        # Fusion
+        combined = torch.cat([x, s], dim=1)
+        combined = self.fusion_dropout1(self.fusion_relu1(self.fusion_bn1(self.fusion_fc1(combined))))
+        combined = self.fusion_dropout2(self.fusion_relu2(self.fusion_bn2(self.fusion_fc2(combined))))
+        
+        output = self.fc_out(combined)
+        return output
 
+
+# ============================================================================
+# SPATIAL FEATURE EXTRACTION (same as inference)
+# ============================================================================
+
+def calculate_body_angle(keypoints):
+    """Calculate angle of body from vertical axis"""
+    left_shoulder = keypoints[5]
+    right_shoulder = keypoints[6]
+    left_hip = keypoints[11]
+    right_hip = keypoints[12]
+    
+    if (left_shoulder[2] < 0.3 or right_shoulder[2] < 0.3 or 
+        left_hip[2] < 0.3 or right_hip[2] < 0.3):
+        return None
+    
+    shoulder_center = np.array([
+        (left_shoulder[0] + right_shoulder[0]) / 2,
+        (left_shoulder[1] + right_shoulder[1]) / 2
+    ])
+    hip_center = np.array([
+        (left_hip[0] + right_hip[0]) / 2,
+        (left_hip[1] + right_hip[1]) / 2
+    ])
+    
+    body_vector = hip_center - shoulder_center
+    vertical_vector = np.array([0, 1])
+    
+    if np.linalg.norm(body_vector) < 1e-6:
+        return None
+    
+    cos_angle = np.dot(body_vector, vertical_vector) / (np.linalg.norm(body_vector) * np.linalg.norm(vertical_vector))
+    cos_angle = np.clip(cos_angle, -1.0, 1.0)
+    angle = np.degrees(np.arccos(cos_angle))
+    
+    return angle
+
+
+def check_hip_position(keypoints, image_shape):
+    """Check if hips are at ground level"""
+    h, w = image_shape[:2]
+    left_hip = keypoints[11]
+    right_hip = keypoints[12]
+    
+    hip_y_values = []
+    if left_hip[2] > 0.3:
+        hip_y_values.append(left_hip[1])
+    if right_hip[2] > 0.3:
+        hip_y_values.append(right_hip[1])
+    
+    if not hip_y_values:
+        return None
+    
+    return np.mean(hip_y_values) / h
+
+
+def check_knee_position(keypoints, image_shape):
+    """Check knee positions"""
+    h, w = image_shape[:2]
+    left_knee = keypoints[13]
+    right_knee = keypoints[14]
+    left_hip = keypoints[11]
+    right_hip = keypoints[12]
+    
+    visible_knees = []
+    visible_hips = []
+    
+    if left_knee[2] > 0.3:
+        visible_knees.append(left_knee)
+    if right_knee[2] > 0.3:
+        visible_knees.append(right_knee)
+    if left_hip[2] > 0.3:
+        visible_hips.append(left_hip)
+    if right_hip[2] > 0.3:
+        visible_hips.append(right_hip)
+    
+    if not visible_knees or not visible_hips:
+        return None, None
+    
+    avg_knee_y = np.mean([k[1] for k in visible_knees])
+    avg_hip_y = np.mean([h[1] for h in visible_hips])
+    
+    knee_hip_distance = (avg_knee_y - avg_hip_y) / h
+    relative_knee_y = avg_knee_y / h
+    
+    return knee_hip_distance, relative_knee_y
+
+
+def calculate_center_of_mass(keypoints):
+    """Calculate approximate center of mass Y-coordinate"""
+    torso_indices = [5, 6, 11, 12]
+    
+    visible_torso = []
+    for idx in torso_indices:
+        if keypoints[idx, 2] > 0.3:
+            visible_torso.append(keypoints[idx, 1])
+    
+    if len(visible_torso) < 2:
+        return None
+    
+    return np.mean(visible_torso)
+
+
+def calculate_body_dimensions(keypoints):
+    """Calculate body width and height ratios - MUST MATCH TRAINING CODE"""
+    visible_kps = keypoints[keypoints[:, 2] > 0.3]
+    
+    if len(visible_kps) < 5:
+        return None, None
+    
+    x_coords = visible_kps[:, 0]
+    y_coords = visible_kps[:, 1]
+    
+    width = np.max(x_coords) - np.min(x_coords)
+    height = np.max(y_coords) - np.min(y_coords)
+    
+    if height < 1:
+        return None, None
+    
+    aspect_ratio = width / height
+    relative_height = height
+    
+    return aspect_ratio, relative_height
+
+
+
+
+def extract_spatial_features(keypoints, image_shape):
+    """Extract 7 spatial features for the MLP branch - MUST MATCH TRAINING CODE EXACTLY"""
+    # Handle both (h, w) and (h, w, c) formats
+    if len(image_shape) == 3:
+        h, w, _ = image_shape
+    else:
+        h, w = image_shape[:2]
+    
+    spatial_features = []
+    
+    # 1. Body angle (default: 45.0 - NOT 0.0!)
+    angle = calculate_body_angle(keypoints)
+    spatial_features.append(angle if angle is not None else 45.0)
+    
+    # 2. Hip height (default: 0.5)
+    hip_height = check_hip_position(keypoints, image_shape)
+    spatial_features.append(hip_height if hip_height is not None else 0.5)
+    
+    # 3. Aspect ratio (default: 0.5)
+    aspect_ratio, body_height = calculate_body_dimensions(keypoints)
+    spatial_features.append(aspect_ratio if aspect_ratio is not None else 0.5)
+    
+    # 4. Body height / h (default: 0.5)
+    spatial_features.append(body_height / h if body_height else 0.5)
+    
+    # 5. Knee-hip distance (default: 0.0)
+    knee_hip_dist, knee_height = check_knee_position(keypoints, image_shape)
+    spatial_features.append(knee_hip_dist if knee_hip_dist is not None else 0.0)
+    
+    # 6. Knee height (default: 0.5)
+    spatial_features.append(knee_height if knee_height is not None else 0.5)
+    
+    # 7. Center of mass / h (default: 0.5)
+    com_y = calculate_center_of_mass(keypoints)
+    spatial_features.append(com_y / h if com_y else 0.5)
+    
+    return np.array(spatial_features, dtype=np.float32)
+
+
+# ============================================================================
+# FALL DETECTOR CLASS
+# ============================================================================
 
 class FallDetector:
     def __init__(self):
@@ -98,55 +293,39 @@ class FallDetector:
         self.pose_model = YOLO(Config.YOLO_MODEL)
         print("✓ YOLO model loaded")
         
-        # Load 1D-CNN classifier
-        print("Loading 1D-CNN classifier...")
-        self.cnn_model = Spatial1DCNN(
-            input_channels=Config.NUM_COORDS,
-            num_classes=len(Config.CLASS_NAMES)
+        # Load Enhanced 1D-CNN classifier
+        print("Loading Enhanced 1D-CNN classifier...")
+        self.cnn_model = EnhancedSpatial1DCNN(
+            num_classes=len(Config.CLASS_NAMES),
+            dropout_rate=0.4
         ).to(self.device)
         
-        if os.path.exists(Config.CNN_MODEL_PATH):
-            checkpoint = torch.load(Config.CNN_MODEL_PATH, map_location=self.device)
-            
-            if 'model_state_dict' in checkpoint:
-                self.cnn_model.load_state_dict(checkpoint['model_state_dict'])
-                print(f"✓ 1D-CNN model loaded (epoch: {checkpoint.get('epoch', 'N/A')}, val_acc: {checkpoint.get('val_acc', 0):.2f}%)")
-            else:
-                self.cnn_model.load_state_dict(checkpoint)
-                print("✓ 1D-CNN model loaded (legacy format)")
-            
-            self.cnn_model.eval()
-        else:
-            raise FileNotFoundError(f"Model file not found: {Config.CNN_MODEL_PATH}")
+        checkpoint = torch.load(Config.CNN_MODEL_PATH, map_location=self.device)
+        self.cnn_model.load_state_dict(checkpoint['model_state_dict'])
+        self.cnn_model.eval()
+        print(f"✓ Enhanced model loaded (epoch: {checkpoint.get('epoch', 'N/A')}, val_acc: {checkpoint.get('val_acc', 0):.2f}%)")
         
         # Prediction smoothing per track ID
         self.prediction_buffers = defaultdict(lambda: deque(maxlen=Config.SMOOTHING_WINDOW))
         
         # Track fall states per person
-        # Format: {person_id: {'is_fallen': bool, 'incident_id': int or None}}
         self.fall_states = {}
         
         # Database instance
         self.db = get_database()
         
-    def check_keypoints_validity(self, keypoints):
-        """Check if keypoints are sufficient for classification"""
-        if len(keypoints) == 0:
-            return False, "No keypoints detected"
+    def extract_features(self, keypoints, image_shape):
+        """Extract normalized keypoint features (same as inference)"""
+        h, w = image_shape[:2]
         
-        valid_keypoints = np.sum(keypoints[:, 2] > Config.KEYPOINT_MIN_CONFIDENCE)
-        if valid_keypoints < Config.MIN_KEYPOINTS_REQUIRED:
-            return False, f"Insufficient keypoints ({valid_keypoints}/{Config.MIN_KEYPOINTS_REQUIRED})"
+        normalized = keypoints.copy()
+        normalized[:, 0] = normalized[:, 0] / w
+        normalized[:, 1] = normalized[:, 1] / h
         
-        critical_valid = sum(1 for idx in Config.CRITICAL_KEYPOINTS 
-                           if idx < len(keypoints) and keypoints[idx, 2] > Config.KEYPOINT_MIN_CONFIDENCE)
-        if critical_valid < len(Config.CRITICAL_KEYPOINTS) * 0.5:
-            return False, f"Critical keypoints missing ({critical_valid}/{len(Config.CRITICAL_KEYPOINTS)})"
-        
-        return True, "Valid"
+        return normalized
     
     def detect(self, frame):
-        """Detect pose and classify activity with tracking"""
+        """Detect pose and classify activity with tracking (same logic as inference but multi-person)"""
         results = self.pose_model.track(frame, persist=True, verbose=False, conf=0.5)
         
         detections = []
@@ -175,13 +354,29 @@ class FallDetector:
                             'incident_id': None
                         }
                     
-                    is_valid, validity_reason = self.check_keypoints_validity(keypoints)
+                    # SAME VALIDATION AS INFERENCE: Only check if 10+ keypoints visible
+                    visible_count = np.sum(keypoints[:, 2] > 0.3)
                     
-                    if is_valid and box_conf > 0.4:
-                        keypoints_tensor = torch.FloatTensor(keypoints).unsqueeze(0).to(self.device)
+                    if visible_count >= 10:
+                        # Normalize keypoints
+                        keypoints_normalized = self.extract_features(keypoints, frame.shape)
                         
+                        # Prepare tensors
+                        keypoints_tensor = torch.tensor(
+                            keypoints_normalized.reshape(1, Config.NUM_KEYPOINTS, Config.NUM_COORDS),
+                            dtype=torch.float32
+                        ).to(self.device)
+                        
+                        # Extract spatial features
+                        spatial_features = extract_spatial_features(keypoints, frame.shape)
+                        spatial_tensor = torch.tensor(
+                            spatial_features.reshape(1, Config.NUM_SPATIAL_FEATURES),
+                            dtype=torch.float32
+                        ).to(self.device)
+                        
+                        # Forward pass
                         with torch.no_grad():
-                            outputs = self.cnn_model(keypoints_tensor)
+                            outputs = self.cnn_model(keypoints_tensor, spatial_tensor)
                             probabilities = torch.softmax(outputs, dim=1)
                             confidence_val, predicted = torch.max(probabilities, 1)
                             
@@ -198,7 +393,7 @@ class FallDetector:
                         is_currently_fallen = (prediction == 2 and confidence > Config.CONFIDENCE_THRESHOLD)
                         was_fallen = self.fall_states[track_id]['is_fallen']
                         
-                        # NEW FALL DETECTED - Log it!
+                        # NEW FALL DETECTED
                         if is_currently_fallen and not was_fallen:
                             print(f"\n🚨 NEW FALL DETECTED: Person ID {track_id}")
                             incident_id = self.db.log_fall_incident(
@@ -209,7 +404,7 @@ class FallDetector:
                             self.fall_states[track_id]['is_fallen'] = True
                             self.fall_states[track_id]['incident_id'] = incident_id
                         
-                        # RECOVERY DETECTED - Person stood up
+                        # RECOVERY DETECTED
                         elif not is_currently_fallen and was_fallen:
                             print(f"\n✅ RECOVERY: Person ID {track_id} stood up")
                             self.db.resolve_fall_for_person(track_id)
@@ -218,10 +413,10 @@ class FallDetector:
                         
                         status = "classified"
                     else:
+                        # Not enough keypoints - just track
                         prediction = None
                         confidence = 0.0
                         status = "tracking_only"
-                        validity_reason = validity_reason if not is_valid else "Low box confidence"
                     
                     detections.append({
                         'track_id': track_id,
@@ -231,9 +426,9 @@ class FallDetector:
                         'prediction': prediction,
                         'confidence': float(confidence),
                         'status': status,
-                        'reason': validity_reason if status == "tracking_only" else None,
                         'is_fallen': self.fall_states[track_id]['is_fallen'],
-                        'incident_id': self.fall_states[track_id].get('incident_id')
+                        'incident_id': self.fall_states[track_id].get('incident_id'),
+                        'visible_count': visible_count
                     })
         
         # Clean up tracking for people who left the frame
@@ -258,7 +453,7 @@ class FallDetector:
             status = detection['status']
             is_fallen = detection.get('is_fallen', False)
             
-            # Override color to red if person has an active fall incident
+            # Determine color and class name
             if is_fallen:
                 color = (0, 0, 255)  # Red for active fall
                 class_name = "FALLEN"
@@ -269,7 +464,7 @@ class FallDetector:
                 color = (128, 128, 128)
                 class_name = "Tracking"
             
-            # Draw bounding box (thicker for fallen)
+            # Draw bounding box
             x1, y1, x2, y2 = map(int, box)
             thickness = 5 if is_fallen else 3
             cv2.rectangle(frame, (x1, y1), (x2, y2), color, thickness)
@@ -278,7 +473,7 @@ class FallDetector:
             if status == "classified":
                 for i, kp in enumerate(keypoints):
                     x, y, conf = kp
-                    if conf > Config.KEYPOINT_MIN_CONFIDENCE:
+                    if conf > 0.3:
                         cv2.circle(frame, (int(x), int(y)), 4, color, -1)
                 
                 connections = [
@@ -288,8 +483,7 @@ class FallDetector:
                 ]
                 
                 for start, end in connections:
-                    if (keypoints[start, 2] > Config.KEYPOINT_MIN_CONFIDENCE and 
-                        keypoints[end, 2] > Config.KEYPOINT_MIN_CONFIDENCE):
+                    if (keypoints[start, 2] > 0.3 and keypoints[end, 2] > 0.3):
                         pt1 = (int(keypoints[start, 0]), int(keypoints[start, 1]))
                         pt2 = (int(keypoints[end, 0]), int(keypoints[end, 1]))
                         cv2.line(frame, pt1, pt2, color, 2)
@@ -297,12 +491,18 @@ class FallDetector:
             # Draw label
             label_y = max(y1 - 10, 20)
             
-            if is_fallen:
-                label = f"ID:{track_id} | ⚠ {class_name} ⚠"
+            if status == "tracking_only":
+                if is_fallen:
+                    label = f"ID:{track_id} | ⚠ FALLEN (Tracking) ⚠"
+                else:
+                    label = f"ID:{track_id} | Tracking ({detection['visible_count']}/10 kpts)"
             elif status == "classified":
-                label = f"ID:{track_id} | {class_name} ({confidence*100:.0f}%)"
+                if is_fallen:
+                    label = f"ID:{track_id} | ⚠ {class_name} ⚠"
+                else:
+                    label = f"ID:{track_id} | {class_name} ({confidence*100:.0f}%)"
             else:
-                label = f"ID:{track_id} | {class_name}"
+                label = f"ID:{track_id} | Unknown"
             
             (label_w, label_h), _ = cv2.getTextSize(label, cv2.FONT_HERSHEY_SIMPLEX, 0.6, 2)
             cv2.rectangle(frame, (x1, label_y - label_h - 8), (x1 + label_w + 10, label_y + 2), color, -1)
@@ -311,6 +511,10 @@ class FallDetector:
         
         return frame
 
+
+# ============================================================================
+# FLASK APPLICATION
+# ============================================================================
 
 # Global variables
 detector = None
@@ -415,7 +619,7 @@ def generate_frames():
                    b'Content-Type: image/jpeg\r\n\r\n' + frame_bytes + b'\r\n')
             time.sleep(1)
     
-    print("✓ Starting frame generation with multi-person tracking...")
+    print("✓ Starting frame generation (inference logic + multi-person tracking)...")
     frame_count = 0
     fps_time = time.time()
     fps_value = 0
@@ -517,7 +721,8 @@ def health():
     return jsonify({
         'status': 'healthy',
         'detector_loaded': detector is not None,
-        'camera_available': cam_available
+        'camera_available': cam_available,
+        'model_type': 'EnhancedSpatial1DCNN (Inference Logic)'
     })
 
 
@@ -527,7 +732,7 @@ def get_incidents():
     try:
         db = get_database()
         
-        status_filter = request.args.get('status')  # 'Active' or 'Resolved'
+        status_filter = request.args.get('status')
         limit = int(request.args.get('limit', 100))
         
         if status_filter:
@@ -617,7 +822,7 @@ def clear_all_incidents():
 
 if __name__ == '__main__':
     print("\n" + "="*60)
-    print("CAIretaker Backend - Fall Detection with Database Logging")
+    print("CAIretaker Backend - Inference Logic + Multi-Person Tracking")
     print("="*60)
     
     if initialize_detector():
@@ -631,9 +836,6 @@ if __name__ == '__main__':
         
         print("\nStarting Flask server...")
         print("Backend will be available at: http://localhost:5000")
-        print("Video feed: http://localhost:5000/video_feed")
-        print("Status API: http://localhost:5000/status")
-        print("Incidents API: http://localhost:5000/incidents")
         print("="*60 + "\n")
         
         app.run(host='0.0.0.0', port=5000, debug=False, threaded=True)
