@@ -16,6 +16,8 @@ FIXES IMPLEMENTED:
    - Uses leg angle analysis to distinguish bending from falling
    - Prevents false positives when bending down to pick up objects
    - Overrides high-confidence fallen predictions if bending detected
+   
+*** UPDATED WITH MULTI-CAMERA SWITCHING SUPPORT ***
 """
 
 from flask import Flask, Response, jsonify, request
@@ -40,7 +42,7 @@ CORS(app)
 class Config:
     OUTPUT_DIR = "backend\spatial_branch_output"
     CNN_MODEL_PATH = os.path.join(OUTPUT_DIR, "enhanced_cnn1d_model.pth")
-    YOLO_MODEL = "yolo11m-pose.pt"
+    YOLO_MODEL = "yolo11n-pose.pt"
     CONFIDENCE_THRESHOLD = 0.65
     SMOOTHING_WINDOW = 7
     
@@ -1045,13 +1047,14 @@ class FallDetector:
 
 
 # ============================================================================
-# CAMERA & GLOBAL STATE
+# CAMERA & GLOBAL STATE - *** UPDATED WITH MULTI-CAMERA SUPPORT ***
 # ============================================================================
 
 # Global variables
 camera = None
 camera_initialized = False
 detector = None
+current_camera_index = 0  # NEW: Track which camera is active
 current_status = {
     'people_detected': 0,
     'detections': [],
@@ -1078,19 +1081,19 @@ def initialize_detector():
         return False
 
 
-def initialize_camera():
-    """Initialize webcam with error handling"""
-    global camera, camera_initialized
+def initialize_camera(camera_index=0):
+    """Initialize camera with specified index"""
+    global camera, camera_initialized, current_camera_index
     
     with camera_lock:
         if camera is not None:
             camera.release()
         
         try:
-            camera = cv2.VideoCapture(0)
+            camera = cv2.VideoCapture(camera_index)
             
             if not camera.isOpened():
-                print("✗ Failed to open webcam")
+                print(f"✗ Failed to open camera {camera_index}")
                 camera = None
                 camera_initialized = False
                 return False
@@ -1103,18 +1106,19 @@ def initialize_camera():
             # Test read
             success, test_frame = camera.read()
             if not success or test_frame is None:
-                print("✗ Camera opened but cannot read frames")
+                print(f"✗ Camera {camera_index} opened but cannot read frames")
                 camera.release()
                 camera = None
                 camera_initialized = False
                 return False
             
+            current_camera_index = camera_index
             camera_initialized = True
-            print("✓ Camera initialized successfully")
+            print(f"✓ Camera {camera_index} initialized successfully")
             return True
             
         except Exception as e:
-            print(f"✗ Error initializing camera: {e}")
+            print(f"✗ Error initializing camera {camera_index}: {e}")
             camera = None
             camera_initialized = False
             return False
@@ -1126,7 +1130,7 @@ def generate_frames():
     
     if not camera_initialized:
         print("⚠ Camera not initialized, attempting to initialize...")
-        if not initialize_camera():
+        if not initialize_camera(current_camera_index):
             print("✗ Camera initialization failed, sending error frame...")
             
             error_frame = np.zeros((480, 640, 3), dtype=np.uint8)
@@ -1143,7 +1147,7 @@ def generate_frames():
                        b'Content-Type: image/jpeg\r\n\r\n' + frame_bytes + b'\r\n')
                 time.sleep(1)
     
-    print("✓ Starting frame generation (inference logic + multi-person tracking)...")
+    print(f"✓ Starting frame generation for camera {current_camera_index} (inference logic + multi-person tracking)...")
     frame_count = 0
     fps_time = time.time()
     fps_value = 0
@@ -1154,7 +1158,7 @@ def generate_frames():
             with camera_lock:
                 if camera is None or not camera.isOpened():
                     print("⚠ Camera lost, attempting to reconnect...")
-                    if not initialize_camera():
+                    if not initialize_camera(current_camera_index):
                         time.sleep(1)
                         continue
                 
@@ -1167,7 +1171,7 @@ def generate_frames():
                 if consecutive_failures > 10:
                     print("✗ Too many consecutive failures, reinitializing camera...")
                     camera_initialized = False
-                    if not initialize_camera():
+                    if not initialize_camera(current_camera_index):
                         time.sleep(1)
                     consecutive_failures = 0
                 
@@ -1202,8 +1206,9 @@ def generate_frames():
                     fps_time = current_time
                     current_status['fps'] = round(fps_value, 1)
                 
-                cv2.putText(frame, f"FPS: {fps_value:.1f}", 
-                           (frame.shape[1] - 200, 40),
+                # UPDATED to show camera index
+                cv2.putText(frame, f"FPS: {fps_value:.1f} | Camera: {current_camera_index}", 
+                           (frame.shape[1] - 350, 40),
                            cv2.FONT_HERSHEY_SIMPLEX, 1.0, (255, 255, 255), 2)
             
             ret, buffer = cv2.imencode('.jpg', frame, [cv2.IMWRITE_JPEG_QUALITY, 85])
@@ -1222,13 +1227,66 @@ def generate_frames():
             traceback.print_exc()
             time.sleep(0.1)
 
+# ============================================================================
+# API ENDPOINTS - *** UPDATED WITH CAMERA SWITCHING ***
+# ============================================================================
 
 @app.route('/video_feed')
 def video_feed():
     """Video streaming route"""
-    print("📹 Video feed requested")
+    print(f"📹 Video feed requested for camera {current_camera_index}")
     return Response(generate_frames(),
                    mimetype='multipart/x-mixed-replace; boundary=frame')
+
+
+@app.route('/switch_camera', methods=['POST'])
+def switch_camera():
+    """NEW ENDPOINT: Switch to a different camera"""
+    global current_camera_index, camera_initialized
+    
+    try:
+        data = request.get_json()
+        new_camera_index = data.get('camera_index', 0)
+        
+        print(f"🔄 Switching from camera {current_camera_index} to camera {new_camera_index}")
+        
+        camera_initialized = False
+        if initialize_camera(new_camera_index):
+            return jsonify({
+                'success': True,
+                'message': f'Switched to camera {new_camera_index}',
+                'camera_index': current_camera_index
+            })
+        else:
+            return jsonify({
+                'success': False,
+                'message': f'Failed to switch to camera {new_camera_index}'
+            }), 500
+            
+    except Exception as e:
+        return jsonify({
+            'success': False,
+            'error': str(e)
+        }), 500
+
+
+@app.route('/available_cameras', methods=['GET'])
+def get_available_cameras():
+    """NEW ENDPOINT: Get list of available camera indices"""
+    available = []
+    
+    # Test cameras 0-9
+    for i in range(10):
+        cap = cv2.VideoCapture(i)
+        if cap.isOpened():
+            available.append(i)
+            cap.release()
+    
+    return jsonify({
+        'success': True,
+        'cameras': available,
+        'current_camera': current_camera_index
+    })
 
 
 @app.route('/status')
@@ -1248,7 +1306,8 @@ def health():
         'status': 'healthy',
         'detector_loaded': detector is not None,
         'camera_available': cam_available,
-        'model_type': 'EnhancedSpatial1DCNN (Reset-on-Recovery + 75% Threshold)'
+        'current_camera_index': current_camera_index, # <-- UPDATED
+        'model_type': 'EnhancedSpatial1DCNN (Reset-on-Recovery + 75% Threshold + Multi-Camera)' # <-- UPDATED
     })
 
 
@@ -1328,6 +1387,10 @@ def delete_incident(incident_id):
             'error': str(e)
         }), 500
 
+
+# ============================================================================
+# *** ORIGINAL ANALYTICS ENDPOINTS (PRESERVED) ***
+# ============================================================================
 
 @app.route('/analytics/at-risk', methods=['GET'])
 def get_at_risk_analytics():
@@ -1426,12 +1489,12 @@ def clear_all_incidents():
 
 if __name__ == '__main__':
     print("\n" + "="*60)
-    print("CAIretaker Backend - Reset-on-Recovery + 75% Threshold")
+    print("CAIretaker Backend - Multi-Camera Support Enabled")
     print("="*60)
     
     if initialize_detector():
-        print("\nInitializing camera at startup...")
-        camera_success = initialize_camera()
+        print("\nInitializing default camera at startup...")
+        camera_success = initialize_camera(0) # <-- UPDATED
         
         if not camera_success:
             print("\n⚠ Warning: Camera initialization failed.")
@@ -1440,6 +1503,11 @@ if __name__ == '__main__':
         
         print("\nStarting Flask server...")
         print("Backend will be available at: http://localhost:5000")
+        # --- NEW PRINT STATEMENTS ---
+        print("\nNew endpoints:")
+        print("  POST /switch_camera - Switch between cameras")
+        print("  GET /available_cameras - Get list of available cameras")
+        # ----------------------------
         print("="*60 + "\n")
         
         app.run(host='0.0.0.0', port=5000, debug=False, threaded=True)

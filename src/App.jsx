@@ -14,6 +14,9 @@ const { Header, Content } = Layout;
 
 function App() {
   const [currentPage, setCurrentPage] = useState('dashboard');
+  // Shared state for active camera feed
+  const [activeCameraId, setActiveCameraId] = useState('camera-1');
+  const [cameraChangeTimestamp, setCameraChangeTimestamp] = useState(Date.now());
 
   const menuItems = [
     {
@@ -31,21 +34,32 @@ function App() {
       icon: <MonitorOutlined />,
       label: 'Monitoring',
     },
-
   ];
+
+  // Function to handle camera switching
+  const handleCameraSwitch = (cameraId) => {
+    setActiveCameraId(cameraId);
+    setCameraChangeTimestamp(Date.now());
+  };
 
   const renderPage = () => {
     switch (currentPage) {
       case 'dashboard':
-        return <Dashboard />;
+        return (
+          <Dashboard 
+            activeCameraId={activeCameraId}
+            cameraChangeTimestamp={cameraChangeTimestamp}
+          />
+        );
       case 'logs':
         return <Logs />;
       case 'monitoring':
-        return <Monitoring />;
-      case 'settings':
-        return <Settings />;
-      case 'livecamera':
-        return <WebcamFeed />;
+        return (
+          <Monitoring 
+            activeCameraId={activeCameraId}
+            onCameraSwitch={handleCameraSwitch}
+          />
+        );
       default:
         return <Dashboard />;
     }
