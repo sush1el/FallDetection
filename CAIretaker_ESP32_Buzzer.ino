@@ -22,11 +22,11 @@
 // ========================================
 
 // WiFi Credentials
-const char* WIFI_SSID = "PLDTHOMEFIBR2A1A3";           // Replace with your WiFi name
-const char* WIFI_PASSWORD = "PLDTWIFI1HMBT";   // Replace with your WiFi password
+const char* WIFI_SSID = "*******";           // Replace with your WiFi name
+const char* WIFI_PASSWORD = "*******";   // Replace with your WiFi password
 
 // Flask Backend Configuration
-const char* BACKEND_URL = "http://192.168.1.31:5000";  // Replace with your Flask server IP address
+const char* BACKEND_URL = "***********";  // Replace with your Flask server IP address
 
 // Hardware Configuration 
 const int BUZZER_PIN = 2;  // Changed from 23 to 2 for ESP32-CAM
