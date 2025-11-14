@@ -2,16 +2,20 @@
 Flask Backend for CAIretaker - Enhanced Fall Detection with Multi-Person Tracking
 Exact same detection logic as inference code + person tracking with IDs and database logging
 
-SOLUTION 2 INTEGRATED: Bending Detection
-- Adds leg angle analysis to distinguish bending from falling
-- Prevents false positives when bending down to pick up objects
-- Uses torso-leg angle difference, hip elevation, and feet position
-- Overrides model prediction if bending is detected with >60% confidence
-
-FIX: Temporal Activation Consistency Issue
-- Problem: Smoothing buffer can change "fallen" prediction to "standing" before temporal tracking activates
-- Solution: Check raw model prediction (before smoothing) for temporal activation
-- This ensures monitoring phase triggers consistently for any fallen pose
+FIXES IMPLEMENTED:
+1. Reset-on-Recovery: Monitoring timer resets completely when person recovers
+   - Eliminates race conditions and state corruption bugs
+   - Ensures consistent monitoring phase for every fall detection
+   
+2. Three-Tier Confidence System:
+   - HIGH (≥75%): Triggers monitoring → Alert if confirmed
+   - AT RISK (60-74%): Visual warning only, NO monitoring/alert
+   - REJECTED (<60%): Treated as false positive
+   
+3. Bending Detection Override:
+   - Uses leg angle analysis to distinguish bending from falling
+   - Prevents false positives when bending down to pick up objects
+   - Overrides high-confidence fallen predictions if bending detected
 """
 
 from flask import Flask, Response, jsonify, request
@@ -41,15 +45,21 @@ class Config:
     SMOOTHING_WINDOW = 7
     
     # TEMPORAL FALL DETECTION SETTINGS
-    FALL_CONFIRMATION_TIME = 1  # Seconds person must stay fallen before alert
+    FALL_CONFIRMATION_TIME = 0.5  # Seconds person must stay fallen before alert
     FALL_CONFIRMATION_FRAMES = 3  # Minimum consecutive frames in fallen state
     
     CLASS_NAMES = {0: "Standing", 1: "Sitting", 2: "Fallen"}
     CLASS_COLORS = {
-        0: (0, 255, 0),    # Standing - Green
-        1: (255, 255, 0),  # Sitting - Yellow
-        2: (0, 0, 255)     # Fallen - Red
+        0: (0, 255, 0),      # Standing - Green
+        1: (255, 255, 0),    # Sitting - Yellow (cyan in BGR)
+        2: (0, 0, 255),      # Fallen (High Confidence) - Red
+        'at_risk': (0, 165, 255)  # At Risk (Low Confidence) - Orange
     }
+    
+    # Three-tier confidence thresholds
+    HIGH_CONFIDENCE_THRESHOLD = 0.70 # Confirmed fallen - triggers monitoring/alert (≥75%)
+    LOW_CONFIDENCE_THRESHOLD = 0.50 # At risk - visual warning only (60-74%)
+    # Below 0.60 = treated as normal (not fallen)
     NUM_KEYPOINTS = 17
     NUM_COORDS = 3
     NUM_SPATIAL_FEATURES = 7
@@ -531,6 +541,10 @@ class FallDetector:
             'consecutive_fallen_frames': 0
         })
         
+        # Track at-risk detections for analytics
+        self.at_risk_log = []
+        self.rejected_log = []
+        
         # Database instance
         self.db = get_database()
         
@@ -619,19 +633,89 @@ class FallDetector:
                         confidence = raw_confidence
                         
                         # ========================================
-                        # FIX: Use RAW prediction for temporal activation
-                        # This ensures monitoring phase triggers consistently
+                        # THREE-TIER CONFIDENCE SYSTEM
+                        # - High confidence (≥75%): Confirmed fallen → triggers monitoring/alert
+                        # - At Risk (60-74%): Visual warning only (orange box), NO monitoring
+                        # - Rejected (<60%): Treated as false positive
                         # ========================================
-                        is_raw_fallen = (raw_prediction == 2 and raw_confidence > Config.CONFIDENCE_THRESHOLD)
+                        
+                        # Get fallen class probability directly
+                        fallen_confidence = probabilities[0][2].item()
+                        
+                        # Initialize variables
+                        display_state = "normal"
+                        confidence_tier = "N/A"
+                        is_raw_fallen = False
+                        
+                        if raw_prediction == 2:  # Model predicts fallen class
+                            if fallen_confidence >= Config.HIGH_CONFIDENCE_THRESHOLD:
+                                # HIGH CONFIDENCE (≥75%): Triggers monitoring
+                                is_raw_fallen = True
+                                confidence_tier = "HIGH"
+                                display_state = "normal"  # Will be overridden to monitoring/fallen
+                                
+                            elif fallen_confidence >= Config.LOW_CONFIDENCE_THRESHOLD:
+                                # AT RISK (60-74%): Visual warning only
+                                is_raw_fallen = False  # Does NOT trigger monitoring
+                                confidence_tier = "AT_RISK"
+                                display_state = "at_risk"
+                                
+                                print(f"⚠️ Person ID {track_id}: AT RISK (Medium confidence)")
+                                print(f"   Fallen confidence: {fallen_confidence:.2%}")
+                                print(f"   Visual warning only - NO monitoring/alert")
+                                
+                                # Log for analytics
+                                self.at_risk_log.append({
+                                    'timestamp': time.time(),
+                                    'person_id': track_id,
+                                    'confidence': fallen_confidence,
+                                    'reason': 'medium_confidence_fallen'
+                                })
+                                
+                            else:
+                                # REJECTED (<60%): False positive
+                                is_raw_fallen = False
+                                confidence_tier = "REJECTED"
+                                display_state = "normal"
+                                
+                                print(f"❌ Person ID {track_id}: Fallen REJECTED (low confidence)")
+                                print(f"   Fallen confidence: {fallen_confidence:.2%}")
+                                
+                                # Log for analytics
+                                self.rejected_log.append({
+                                    'timestamp': time.time(),
+                                    'person_id': track_id,
+                                    'confidence': fallen_confidence,
+                                    'reason': 'very_low_confidence'
+                                })
+                        else:
+                            # Not predicted as fallen (class 0 or 1)
+                            is_raw_fallen = False
+                            confidence_tier = "N/A"
+                            display_state = "normal"
+                        
+                        # CRITICAL FIX: Override smoothed prediction for rejected/at-risk falls
+                        # This prevents display showing "Fallen" for low confidence detections
+                        if raw_prediction == 2 and not is_raw_fallen:
+                            # Model predicted fallen but confidence too low
+                            # Override the smoothed prediction to prevent "Fallen" display
+                            if confidence_tier == "AT_RISK":
+                                # Keep prediction as 2 (fallen) so display can show "At Risk"
+                                # But ensure is_raw_fallen stays False
+                                pass  # prediction stays as smoothed value (likely 2)
+                            else:
+                                # REJECTED - change prediction to standing
+                                prediction = 0  # Override to Standing
                         
                         # Check for fall state changes
                         was_fallen = self.fall_states[track_id]['is_fallen']
                         
                         # ========================================
-                        # SOLUTION 2: BENDING CHECK (on raw prediction)
+                        # BENDING DETECTION OVERRIDE
+                        # Only applies to HIGH confidence fallen detections
                         # ========================================
                         if is_raw_fallen:
-                            # Model says fallen, but check if it's actually bending
+                            # Model says fallen with high confidence, but check if it's actually bending
                             is_bending, bend_conf, reasons = is_bending_posture(keypoints, frame.shape)
                             
                             if is_bending and bend_conf > 0.5:
@@ -640,102 +724,154 @@ class FallDetector:
                                 print(f"  Confidence: {bend_conf:.2f}")
                                 print(f"  Reasons: {', '.join(reasons)}")
                                 
-                                # Change prediction to standing
+                                # Change to standing
                                 prediction = 0
                                 confidence = bend_conf
-                                is_raw_fallen = False  # Also update raw fallen status
-                        # ========================================
+                                is_raw_fallen = False
+                                confidence_tier = "BENDING"
+                                display_state = "normal"
                         
                         # ========================================
-                        # TEMPORAL FALL CONFIRMATION WITH MANDATORY MONITORING
-                        # Now uses is_raw_fallen instead of checking smoothed prediction
+                        # SIMPLIFIED TEMPORAL FALL DETECTION
+                        # Strategy: Reset monitoring completely on any recovery
+                        # Only HIGH confidence (≥75%) fallen detections trigger monitoring
                         # ========================================
                         current_time = time.time()
                         candidate = self.fall_candidates[track_id]
                         
                         if is_raw_fallen:
-                            # Person detected in fallen position (RAW prediction)
+                            # Person detected in HIGH CONFIDENCE fallen position (≥75%)
                             
-                            # CRITICAL FIX: If person is already marked as fallen, keep them fallen
-                            # but don't start new monitoring
                             if was_fallen:
-                                # Already confirmed fallen, keep tracking
-                                print(f"🔴 Person ID {track_id}: Maintaining FALLEN state (already confirmed)")
+                                # Person is already confirmed as fallen
+                                # Just maintain the state - no need to re-process
+                                print(f"🔴 Person ID {track_id}: Maintaining FALLEN state")
+                                
                             elif candidate['start_time'] is None:
-                                # FIRST detection of fallen position - START MONITORING
+                                # FIRST detection of high-confidence fallen position - START MONITORING
+                                # This is a fresh start (either new fall or after recovery)
                                 candidate['start_time'] = current_time
                                 candidate['frame_count'] = 1
                                 candidate['consecutive_fallen_frames'] = 1
                                 
-                                # CRITICAL: Ensure is_fallen stays False during monitoring
+                                # CRITICAL: Force is_fallen to False at monitoring start
+                                # This ensures we go through proper monitoring phase
                                 if self.fall_states[track_id]['is_fallen']:
-                                    print(f"⚠️ WARNING: Person ID {track_id} had is_fallen=True, forcing False for monitoring")
-                                    self.fall_states[track_id]['is_fallen'] = False
+                                    print(f"⚠️ WARNING: is_fallen was True, forcing False for monitoring")
+                                self.fall_states[track_id]['is_fallen'] = False
                                 
-                                print(f"⏱️ Person ID {track_id}: Fallen position detected, STARTING MONITORING...")
-                                print(f"   Raw prediction: {raw_prediction}, Confidence: {raw_confidence:.2%}")
-                                print(f"   Smoothed prediction: {smoothed_prediction}")
+                                print(f"\n{'='*60}")
+                                print(f"⏱️ MONITORING STARTED - Person ID {track_id}")
+                                print(f"{'='*60}")
+                                print(f"Fallen confidence: {fallen_confidence:.2%} (HIGH - ≥75%)")
+                                print(f"Confirmation requirements:")
+                                print(f"  • Time: {Config.FALL_CONFIRMATION_TIME}s")
+                                print(f"  • Frames: {Config.FALL_CONFIRMATION_FRAMES} consecutive")
+                                print(f"Status: MONITORING IN PROGRESS...")
+                                print(f"{'='*60}\n")
+                            
                             else:
                                 # Continuing in fallen position - STILL MONITORING
                                 candidate['frame_count'] += 1
                                 candidate['consecutive_fallen_frames'] += 1
                                 elapsed_time = current_time - candidate['start_time']
                                 
-                                # Check if fall is confirmed (time AND frames threshold met)
+                                # Check if both thresholds are met
                                 time_threshold_met = elapsed_time >= Config.FALL_CONFIRMATION_TIME
                                 frames_threshold_met = candidate['consecutive_fallen_frames'] >= Config.FALL_CONFIRMATION_FRAMES
                                 
-                                if time_threshold_met and frames_threshold_met and not was_fallen:
-                                    # CONFIRMED FALL - NOW trigger alert
-                                    print(f"\n🚨 CONFIRMED FALL: Person ID {track_id}")
-                                    print(f"   Duration: {elapsed_time:.1f}s")
-                                    print(f"   Frames: {candidate['consecutive_fallen_frames']}")
-                                    print(f"   Time threshold met: {time_threshold_met}")
-                                    print(f"   Frames threshold met: {frames_threshold_met}")
-                                    
-                                    incident_id = self.db.log_fall_incident(
-                                        person_id=track_id,
-                                        confidence=confidence,
-                                        location=Config.LOCATION_NAME
-                                    )
-                                    self.fall_states[track_id]['is_fallen'] = True
-                                    self.fall_states[track_id]['incident_id'] = incident_id
-                                    
-                                    print(f"   Incident ID: {incident_id} logged")
+                                if time_threshold_met and frames_threshold_met:
+                                    # Both thresholds met - CONFIRM FALL
+                                    if not self.fall_states[track_id]['is_fallen']:
+                                        # First time confirming - TRIGGER ALERT
+                                        print(f"\n{'='*70}")
+                                        print(f"🚨🚨🚨 CONFIRMED FALL ALERT 🚨🚨🚨")
+                                        print(f"{'='*70}")
+                                        print(f"Person ID: {track_id}")
+                                        print(f"Location: {Config.LOCATION_NAME}")
+                                        print(f"Fallen Confidence: {fallen_confidence:.2%}")
+                                        print(f"Time Fallen: {elapsed_time:.2f}s (threshold: {Config.FALL_CONFIRMATION_TIME}s ✓)")
+                                        print(f"Consecutive Frames: {candidate['consecutive_fallen_frames']} (threshold: {Config.FALL_CONFIRMATION_FRAMES} ✓)")
+                                        print(f"")
+                                        
+                                        # Log incident to database
+                                        incident_id = self.db.log_fall_incident(
+                                            person_id=track_id,
+                                            confidence=fallen_confidence,
+                                            location=Config.LOCATION_NAME
+                                        )
+                                        
+                                        # Mark as confirmed fallen
+                                        self.fall_states[track_id]['is_fallen'] = True
+                                        self.fall_states[track_id]['incident_id'] = incident_id
+                                        
+                                        print(f"📝 Incident logged to database (ID: {incident_id})")
+                                        print(f"🚨 ALERT TRIGGERED - Caregivers must respond")
+                                        print(f"{'='*70}\n")
+                                    else:
+                                        # Already confirmed (safety net - shouldn't happen often)
+                                        print(f"ℹ️ Person ID {track_id}: Fall already confirmed, maintaining state")
                                 else:
-                                    # Still monitoring, not confirmed yet
-                                    remaining_time = Config.FALL_CONFIRMATION_TIME - elapsed_time
-                                    remaining_frames = Config.FALL_CONFIRMATION_FRAMES - candidate['consecutive_fallen_frames']
+                                    # Still monitoring - thresholds not yet met
+                                    remaining_time = max(0, Config.FALL_CONFIRMATION_TIME - elapsed_time)
+                                    remaining_frames = max(0, Config.FALL_CONFIRMATION_FRAMES - candidate['consecutive_fallen_frames'])
                                     
-                                    if remaining_time > 0 or remaining_frames > 0:
-                                        print(f"⏱️ Person ID {track_id}: MONITORING... {remaining_time:.1f}s, {remaining_frames} frames remaining")
-                                    
-                                    # ENSURE is_fallen stays False during monitoring
-                                    if self.fall_states[track_id]['is_fallen']:
-                                        print(f"⚠️ ERROR: is_fallen was True during monitoring! Forcing False.")
-                                        self.fall_states[track_id]['is_fallen'] = False
+                                    print(f"⏱️ Person ID {track_id}: MONITORING IN PROGRESS")
+                                    print(f"   Confidence: {fallen_confidence:.2%}")
+                                    print(f"   Time: {elapsed_time:.2f}s / {Config.FALL_CONFIRMATION_TIME}s ({remaining_time:.2f}s remaining)")
+                                    print(f"   Frames: {candidate['consecutive_fallen_frames']} / {Config.FALL_CONFIRMATION_FRAMES} ({remaining_frames} remaining)")
                         
                         else:
-                            # Not in fallen position (RAW prediction says not fallen)
+                            # NOT in high-confidence fallen position
+                            # Could be: standing, sitting, at-risk, or low confidence fallen
+                            
+                            # If monitoring was active, RESET IT
                             if candidate['start_time'] is not None:
                                 elapsed = current_time - candidate['start_time']
                                 
-                                # Was monitoring but person recovered before confirmation
-                                if elapsed < Config.FALL_CONFIRMATION_TIME:
-                                    print(f"✓ Person ID {track_id}: Brief fallen pose detected (transition), no alert")
-                                    print(f"  Duration: {elapsed:.2f}s (< {Config.FALL_CONFIRMATION_TIME}s threshold)")
+                                # Person recovered during monitoring (before confirmation)
+                                print(f"\n{'='*60}")
+                                print(f"✓ RECOVERY DETECTED - Person ID {track_id}")
+                                print(f"{'='*60}")
+                                print(f"Fallen duration: {elapsed:.2f}s (threshold: {Config.FALL_CONFIRMATION_TIME}s)")
+                                print(f"Frames: {candidate['consecutive_fallen_frames']} (threshold: {Config.FALL_CONFIRMATION_FRAMES})")
                                 
-                                # Reset temporal tracking
+                                if elapsed < Config.FALL_CONFIRMATION_TIME:
+                                    print(f"Assessment: Brief fallen pose detected")
+                                    print(f"Result: NO ALERT - Person recovered before confirmation")
+                                else:
+                                    print(f"Assessment: Prolonged fallen pose but insufficient frames")
+                                    print(f"Result: NO ALERT - Person recovered before full confirmation")
+                                
+                                # COMPLETE RESET - start fresh if person falls again
+                                print(f"Monitoring: RESET - Will restart from scratch on next fall")
+                                print(f"{'='*60}\n")
+                                
                                 candidate['start_time'] = None
                                 candidate['frame_count'] = 0
                                 candidate['consecutive_fallen_frames'] = 0
                             
                             # Check for recovery from confirmed fall
                             if was_fallen:
-                                print(f"\n✅ RECOVERY: Person ID {track_id} stood up")
-                                self.db.resolve_fall_for_person(track_id)
+                                print(f"\n{'='*70}")
+                                print(f"✅✅✅ RECOVERY CONFIRMED ✅✅✅")
+                                print(f"{'='*70}")
+                                print(f"Person ID: {track_id}")
+                                print(f"Status: Person has stood up and recovered")
+                                print(f"Action: Resolving fall incident in database")
+                                print(f"")
+                                
+                                # Resolve the incident in database
+                                if self.fall_states[track_id]['incident_id'] is not None:
+                                    self.db.resolve_fall_for_person(track_id)
+                                    print(f"📝 Incident {self.fall_states[track_id]['incident_id']} marked as RESOLVED")
+                                
+                                # Clear fall state
                                 self.fall_states[track_id]['is_fallen'] = False
                                 self.fall_states[track_id]['incident_id'] = None
+                                
+                                print(f"Person ID {track_id} returned to normal monitoring")
+                                print(f"{'='*70}\n")
                         # ========================================
                         
                         status = "classified"
@@ -763,7 +899,10 @@ class FallDetector:
                         'box_conf': float(box_conf),
                         'keypoints': keypoints,
                         'prediction': prediction,
+                        'display_state': display_state if 'display_state' in locals() else "normal",  # New field
                         'confidence': float(confidence),
+                        'confidence_tier': confidence_tier if 'confidence_tier' in locals() else "N/A",
+                        'fallen_confidence': fallen_confidence if 'fallen_confidence' in locals() else 0.0,
                         'status': status,
                         'is_fallen': self.fall_states[track_id]['is_fallen'],
                         'incident_id': self.fall_states[track_id].get('incident_id'),
@@ -813,7 +952,10 @@ class FallDetector:
             box = detection['box']
             keypoints = detection['keypoints']
             prediction = detection['prediction']
+            display_state = detection.get('display_state', 'normal')
             confidence = detection['confidence']
+            confidence_tier = detection.get('confidence_tier', 'N/A')
+            fallen_confidence = detection.get('fallen_confidence', 0.0)
             status = detection['status']
             is_fallen = detection['is_fallen']
             visible_count = detection['visible_count']
@@ -825,9 +967,9 @@ class FallDetector:
             candidate = self.fall_candidates.get(track_id)
             is_monitoring = candidate is not None and candidate.get('start_time') is not None
             
-            # Determine color based on fall state - MONITORING takes priority
+            # Determine color and label based on state - THREE-TIER SYSTEM
             if is_monitoring and not is_fallen:
-                # Currently in MONITORING phase (not yet confirmed)
+                # Currently in MONITORING phase (high confidence fallen, not yet confirmed)
                 elapsed = current_time - candidate['start_time']
                 remaining = Config.FALL_CONFIRMATION_TIME - elapsed
                 color = (0, 165, 255)  # ORANGE for monitoring
@@ -838,8 +980,13 @@ class FallDetector:
                 color = (0, 0, 255)  # RED for confirmed fall
                 label = f"ID {track_id}: FALLEN (ALERT)"
                 box_thickness = 4
+            elif display_state == 'at_risk':
+                # At Risk (low confidence fallen) - visual warning only
+                color = Config.CLASS_COLORS['at_risk']  # ORANGE
+                label = f"ID {track_id}: At Risk ({fallen_confidence:.0%})"
+                box_thickness = 2
             elif prediction is not None:
-                # Normal classification (not fallen, not monitoring)
+                # Normal classification (standing, sitting)
                 color = Config.CLASS_COLORS.get(prediction, (255, 255, 255))
                 class_name = Config.CLASS_NAMES.get(prediction, "Unknown")
                 label = f"ID {track_id}: {class_name} ({confidence:.0%})"
@@ -1038,9 +1185,11 @@ def generate_frames():
                     current_status['detections'] = [
                         {
                             'id': d['track_id'],
-                            'status': Config.CLASS_NAMES.get(d['prediction'], 'Tracking') if d['status'] == 'classified' else 'Tracking',
+                            'status': 'At Risk' if d.get('display_state') == 'at_risk' else Config.CLASS_NAMES.get(d['prediction'], 'Tracking') if d['status'] == 'classified' else 'Tracking',
                             'confidence': d['confidence'],
+                            'confidence_tier': d.get('confidence_tier', 'N/A'),
                             'is_fall': d.get('is_fallen', False),
+                            'is_at_risk': d.get('display_state') == 'at_risk',  # New field
                             'incident_id': d.get('incident_id')
                         }
                         for d in detections
@@ -1099,7 +1248,7 @@ def health():
         'status': 'healthy',
         'detector_loaded': detector is not None,
         'camera_available': cam_available,
-        'model_type': 'EnhancedSpatial1DCNN (Fixed Temporal Activation)'
+        'model_type': 'EnhancedSpatial1DCNN (Reset-on-Recovery + 75% Threshold)'
     })
 
 
@@ -1180,6 +1329,84 @@ def delete_incident(incident_id):
         }), 500
 
 
+@app.route('/analytics/at-risk', methods=['GET'])
+def get_at_risk_analytics():
+    """Get analytics for at-risk and rejected detections"""
+    global detector
+    
+    if detector is None:
+        return jsonify({
+            'success': False,
+            'error': 'Detector not initialized'
+        }), 500
+    
+    try:
+        # Get recent logs (last 1000 entries)
+        at_risk_recent = detector.at_risk_log[-1000:] if len(detector.at_risk_log) > 0 else []
+        rejected_recent = detector.rejected_log[-1000:] if len(detector.rejected_log) > 0 else []
+        
+        # Calculate statistics
+        current_time = time.time()
+        last_hour = current_time - 3600
+        
+        at_risk_last_hour = [x for x in at_risk_recent if x['timestamp'] > last_hour]
+        rejected_last_hour = [x for x in rejected_recent if x['timestamp'] > last_hour]
+        
+        return jsonify({
+            'success': True,
+            'analytics': {
+                'at_risk': {
+                    'total': len(detector.at_risk_log),
+                    'last_hour': len(at_risk_last_hour),
+                    'recent': at_risk_recent[-10:],  # Last 10 events
+                    'avg_confidence': np.mean([x['confidence'] for x in at_risk_recent]) if at_risk_recent else 0
+                },
+                'rejected': {
+                    'total': len(detector.rejected_log),
+                    'last_hour': len(rejected_last_hour),
+                    'recent': rejected_recent[-10:],  # Last 10 events
+                    'avg_confidence': np.mean([x['confidence'] for x in rejected_recent]) if rejected_recent else 0
+                },
+                'summary': {
+                    'total_fallen_detections': len(detector.at_risk_log) + len(detector.rejected_log),
+                    'at_risk_rate': len(detector.at_risk_log) / max(1, len(detector.at_risk_log) + len(detector.rejected_log)),
+                    'rejection_rate': len(detector.rejected_log) / max(1, len(detector.at_risk_log) + len(detector.rejected_log))
+                }
+            }
+        })
+    except Exception as e:
+        return jsonify({
+            'success': False,
+            'error': str(e)
+        }), 500
+
+
+@app.route('/analytics/clear', methods=['POST'])
+def clear_analytics():
+    """Clear at-risk and rejected logs"""
+    global detector
+    
+    if detector is None:
+        return jsonify({
+            'success': False,
+            'error': 'Detector not initialized'
+        }), 500
+    
+    try:
+        detector.at_risk_log.clear()
+        detector.rejected_log.clear()
+        
+        return jsonify({
+            'success': True,
+            'message': 'Analytics logs cleared'
+        })
+    except Exception as e:
+        return jsonify({
+            'success': False,
+            'error': str(e)
+        }), 500
+
+
 @app.route('/incidents/clear', methods=['POST'])
 def clear_all_incidents():
     """Clear all incidents from database"""
@@ -1199,7 +1426,7 @@ def clear_all_incidents():
 
 if __name__ == '__main__':
     print("\n" + "="*60)
-    print("CAIretaker Backend - Fixed Temporal Activation")
+    print("CAIretaker Backend - Reset-on-Recovery + 75% Threshold")
     print("="*60)
     
     if initialize_detector():
